@@ -36,19 +36,27 @@ public:
 			Sphere sphere;
 			sphere.Position = { 0.0f, -101.0f, 0.0f };
 			sphere.Radius = 100.0f;
-			sphere.MaterialIndex = 1;
+			sphere.MaterialIndex = 1;	
 			m_Scene.Spheres.push_back(sphere);
 		}
 	}
 
 	virtual void OnUpdate(float ts) override {
-		m_Camera.OnUpdate(ts);
+		if (m_Camera.OnUpdate(ts))
+			m_Renderer.ResetFrameIndex();
 	}
+
 	virtual void OnUIRender() override {
 		ImGui::Begin("Settings");
 		ImGui::Text("Last render: %.3fms", m_LastRenderTime);
 		if (ImGui::Button("Render"))
 			Render();
+
+		ImGui::Checkbox("Accumulate", &m_Renderer.GetSettings().Accumulate);
+
+		if (ImGui::Button("Reset"))
+			m_Renderer.ResetFrameIndex();
+
 		ImGui::End();
 
 		ImGui::Begin("Scene");
