@@ -48,7 +48,7 @@ public:
 
 	virtual void OnUIRender() override {
 		ImGui::Begin("Settings");
-		ImGui::Text("Last render: %.3fms", m_LastRenderTime);
+		ImGui::Text("Last render: %.3fms (%.1f FPS)", m_LastRenderTime, m_FPS);
 		if (ImGui::Button("Render"))
 			Render();
 
@@ -113,6 +113,7 @@ public:
 		m_Renderer.Render(m_Scene, m_Camera);
 	
 		m_LastRenderTime = timer.ElapsedMillis();
+		m_FPS = m_LastRenderTime > 0.0f ? 1000.0f / m_LastRenderTime : 0.0f;
 	}
 private:
 	Renderer m_Renderer;
@@ -121,6 +122,7 @@ private:
 	uint32_t m_ViewportWidth = 0, m_ViewportHeight = 0;
 
 	float m_LastRenderTime = 0.0f;
+	float m_FPS = 0.0f;
 };
 
 Walnut::Application* Walnut::CreateApplication(int argc, char** argv) {
