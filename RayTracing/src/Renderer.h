@@ -13,7 +13,7 @@ class Renderer {
 public:
 	struct Settings {
 		bool Accumulate = true;
-		bool SlowRandom = true;
+		bool SlowRandom = false;
 	};
 public:
 	Renderer() = default;

@@ -11,9 +11,9 @@
 
 using namespace Walnut;
 
-class ExampleLayer : public Walnut::Layer {
+class AppLayer : public Walnut::Layer {
 public:
-	ExampleLayer()
+	AppLayer()
 		: m_Camera(45.0f, 0.1f, 100.0f)
 	{
 		Material& pinkSphere = m_Scene.Materials.emplace_back();
@@ -147,7 +147,7 @@ Walnut::Application* Walnut::CreateApplication(int argc, char** argv) {
 	spec.Name = "Ray Tracing";
 
 	Walnut::Application* app = new Walnut::Application(spec);
-	app->PushLayer<ExampleLayer>();
+	app->PushLayer<AppLayer>();
 	app->SetMenubarCallback([app]()
 	{
 		if (ImGui::BeginMenu("File"))
