@@ -5,6 +5,7 @@
 #include "Camera.h"
 #include "Ray.h"
 #include "Scene.h"
+#include "BVH.h"
 
 #include <memory>
 #include <glm/glm.hpp>
@@ -14,6 +15,8 @@ public:
 	struct Settings {
 		bool Accumulate = true;
 		bool SlowRandom = false;
+		bool SkyBox = false;
+		bool UseBVH = true;
 	};
 public:
 	Renderer() = default;
@@ -25,6 +28,9 @@ public:
 
 	void ResetFrameIndex() { m_FrameIndex = 1; }
 	Settings& GetSettings() { return m_Settings; }
+
+	// BVH statistics
+	const BVH& GetBVH() const { return m_BVH; }
 private:
 	struct HitPayload {
 		float HitDistance;
@@ -37,6 +43,8 @@ private:
 	glm::vec4 PerPixel(uint32_t x, uint32_t y); // RayGen
 
 	HitPayload TraceRay(const Ray& ray);
+	HitPayload TraceRayBVH(const Ray& ray);
+	HitPayload TraceRayBruteForce(const Ray& ray);
 	HitPayload ClosestHit(const Ray& ray, float hitDistance, int objectIndex);
 	HitPayload Miss(const Ray& ray);
 private:
@@ -52,4 +60,8 @@ private:
 	glm::vec4* m_AccumulationData = nullptr;
 
 	uint32_t m_FrameIndex = 1;
+
+	// BVH for acceleration
+	BVH m_BVH;
+	bool m_BVHNeedsRebuild = true;
 };

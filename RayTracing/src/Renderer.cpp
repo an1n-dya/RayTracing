@@ -49,7 +49,7 @@ void Renderer::OnResize(uint32_t width, uint32_t height) {
 
 	delete[] m_AccumulationData;
 	m_AccumulationData = new glm::vec4[width * height];
-		
+
 	m_ImageHorizontalIter.resize(width);
 	m_ImageVerticalIter.resize(height);
 	for (uint32_t i = 0; i < width; i++)
@@ -64,6 +64,14 @@ void Renderer::Render(const Scene& scene, const Camera& camera) {
 
 	m_ActiveScene = &scene;
 	m_ActiveCamera = &camera;
+
+	// Rebuild BVH if needed
+	if (m_BVHNeedsRebuild && m_Settings.UseBVH) {
+		m_BVH.Build(scene);
+		m_BVHNeedsRebuild = false;
+		// Reset accumulation when BVH is rebuilt
+		m_FrameIndex = 1;
+	}
 
 	if (m_FrameIndex == 1)
 		memset(m_AccumulationData, 0, m_FinalImage->GetWidth() * m_FinalImage->GetHeight() * sizeof(glm::vec4));
@@ -125,7 +133,8 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y) {
 		Renderer::HitPayload payload = TraceRay(ray);
 		if (payload.HitDistance < 0.0f) {
 			glm::vec3 skyColor = glm::mix(glm::vec3(0.5f, 0.7f, 1.0f), glm::vec3(1.0f, 1.0f, 1.0f), 0.5f * (ray.Direction.y + 1.0f));
-			//light += skyColor * contribution;
+			if (m_Settings.SkyBox)
+				light += skyColor * contribution;
 			break;
 		}
 
@@ -148,14 +157,33 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y) {
 }
 
 Renderer::HitPayload Renderer::TraceRay(const Ray& ray) {
-	// Equation of a sphere:
-	// (bx^2 + by^2)t^2 + (2(axbx + ayby))t + (ax^2 + ay^2 - r^2) = 0
-	// where:
-	// a = ray origin	
-	// b = ray direction
-	// r = radius
-	// t = hit distance	
+	if (m_Settings.UseBVH) {
+		return TraceRayBVH(ray);
+	}
+	else {
+		return TraceRayBruteForce(ray);
+	}
+}
 
+Renderer::HitPayload Renderer::TraceRayBVH(const Ray& ray) {
+	BVH::HitInfo hit = m_BVH.Intersect(ray, *m_ActiveScene);
+
+	if (!hit.Hit) {
+		return Miss(ray);
+	}
+
+	// Convert BVH hit to renderer hit payload
+	HitPayload payload;
+	payload.HitDistance = hit.Distance;
+	payload.ObjectIndex = (int)hit.SphereIndex;
+	payload.WorldPosition = hit.HitPoint;
+	payload.WorldNormal = hit.Normal;
+
+	return payload;
+}
+
+Renderer::HitPayload Renderer::TraceRayBruteForce(const Ray& ray) {
+	// Original brute-force implementation for comparison
 	int closestSphere = -1;
 	float hitDistance = std::numeric_limits<float>::max();
 
@@ -175,7 +203,7 @@ Renderer::HitPayload Renderer::TraceRay(const Ray& ray) {
 
 		// Solve for t using the quadratic formula:
 		// t = (-b +- sqrt(discriminant)) / 2a
-		
+
 		// float t0 = (-b + glm::sqrt(discriminant)) / (2.0f * a); // Second hit distance (currently unused)
 		float closestT = (-b - glm::sqrt(discriminant)) / (2.0f * a);
 		if (closestT > 0.0f && closestT < hitDistance) {
@@ -187,7 +215,7 @@ Renderer::HitPayload Renderer::TraceRay(const Ray& ray) {
 	if (closestSphere < 0)
 		return Miss(ray);
 
-	return ClosestHit(ray, hitDistance,	closestSphere);
+	return ClosestHit(ray, hitDistance, closestSphere);
 }
 
 Renderer::HitPayload Renderer::ClosestHit(const Ray& ray, float hitDistance, int objectIndex) {
