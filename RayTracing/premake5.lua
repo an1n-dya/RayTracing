@@ -5,7 +5,7 @@ project "RayTracing"
    targetdir "bin/%{cfg.buildcfg}"
    staticruntime "off"
 
-   files { "src/**.h", "src/**.cpp" }
+   files { "src/**.h", "src/**.cpp", "src/**.comp" }
 
    includedirs
    {
@@ -25,6 +25,15 @@ project "RayTracing"
 
    targetdir ("../bin/" .. outputdir .. "/%{prj.name}")
    objdir ("../bin-int/" .. outputdir .. "/%{prj.name}")
+
+   -- Working directory for both F5 debugging and the built exe, so the GPU path tracer's
+   -- relative shader path ("src/shaders/PathTrace.comp.spv") resolves the same way either way.
+   debugdir "%{wks.location}/RayTracing"
+
+   -- Compile the GPU compute shader to SPIR-V on every build (Vulkan SDK's glslc, already required to build this project).
+   prebuildcommands {
+      '"%{VULKAN_SDK}/Bin/glslc.exe" "%{wks.location}/RayTracing/src/shaders/PathTrace.comp" -o "%{wks.location}/RayTracing/src/shaders/PathTrace.comp.spv"'
+   }
 
    filter "system:windows"
       systemversion "latest"

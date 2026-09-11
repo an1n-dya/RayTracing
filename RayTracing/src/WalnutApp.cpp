@@ -67,7 +67,11 @@ public:
 			Render();
 
 		ImGui::Checkbox("Accumulate", &m_Renderer.GetSettings().Accumulate);
+		ImGui::Checkbox("Use GPU", &m_Renderer.GetSettings().UseGPU);
+
+		ImGui::BeginDisabled(m_Renderer.GetSettings().UseGPU);
 		ImGui::Checkbox("Slow Random", &m_Renderer.GetSettings().SlowRandom);
+		ImGui::EndDisabled();
 
 		if (ImGui::Button("Reset"))
 			m_Renderer.ResetFrameIndex();
@@ -111,9 +115,10 @@ public:
 		m_ViewportWidth = ImGui::GetContentRegionAvail().x;
 		m_ViewportHeight = ImGui::GetContentRegionAvail().y;
 
-		auto image = m_Renderer.GetFinalImage();
-		if (image)
-			ImGui::Image(image->GetDescriptorSet(), { (float)image->GetWidth(), (float)image->GetHeight() },
+		VkDescriptorSet imageDescriptor = m_Renderer.GetFinalImageDescriptorSet();
+		if (imageDescriptor)
+			ImGui::Image(imageDescriptor,
+				{ (float)m_Renderer.GetFinalImageWidth(), (float)m_Renderer.GetFinalImageHeight() },
 				ImVec2(0, 1), ImVec2(1, 0));
 
 		ImGui::End();
