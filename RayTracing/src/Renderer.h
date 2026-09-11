@@ -3,6 +3,7 @@
 #include "Walnut/Image.h"
 
 #include "Camera.h"
+#include "GpuPathTracer.h"
 #include "Ray.h"
 #include "Scene.h"
 
@@ -14,6 +15,7 @@ public:
 	struct Settings {
 		bool Accumulate = true;
 		bool SlowRandom = false;
+		bool UseGPU = false;
 	};
 public:
 	Renderer() = default;
@@ -21,7 +23,9 @@ public:
 	void OnResize(uint32_t width, uint32_t height);
 	void Render(const Scene& scene, const Camera& camera);
 
-	std::shared_ptr<Walnut::Image> GetFinalImage() const { return m_FinalImage; }
+	VkDescriptorSet GetFinalImageDescriptorSet() const;
+	uint32_t GetFinalImageWidth() const;
+	uint32_t GetFinalImageHeight() const;
 
 	void ResetFrameIndex() { m_FrameIndex = 1; }
 	Settings& GetSettings() { return m_Settings; }
@@ -41,6 +45,7 @@ private:
 	HitPayload Miss(const Ray& ray);
 private:
 	std::shared_ptr<Walnut::Image> m_FinalImage;
+	GpuPathTracer m_GpuPathTracer;
 	Settings m_Settings;
 
 	std::vector<uint32_t> m_ImageHorizontalIter, m_ImageVerticalIter;

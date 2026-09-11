@@ -35,6 +35,8 @@ namespace Utils {
 }
 
 void Renderer::OnResize(uint32_t width, uint32_t height) {
+	m_GpuPathTracer.OnResize(width, height);
+
 	if (m_FinalImage) {
 		if (m_FinalImage->GetWidth() == width && m_FinalImage->GetHeight() == height)
 			return;
@@ -65,41 +67,46 @@ void Renderer::Render(const Scene& scene, const Camera& camera) {
 	m_ActiveScene = &scene;
 	m_ActiveCamera = &camera;
 
-	if (m_FrameIndex == 1)
-		memset(m_AccumulationData, 0, m_FinalImage->GetWidth() * m_FinalImage->GetHeight() * sizeof(glm::vec4));
+	if (m_Settings.UseGPU) {
+		m_GpuPathTracer.Render(scene, camera, m_FrameIndex);
+	}
+	else {
+		if (m_FrameIndex == 1)
+			memset(m_AccumulationData, 0, m_FinalImage->GetWidth() * m_FinalImage->GetHeight() * sizeof(glm::vec4));
 
 #define MT 1
 #if MT
-	std::for_each(std::execution::par, m_ImageVerticalIter.begin(), m_ImageVerticalIter.end(),
-		[this](uint32_t y) {
-			std::for_each(std::execution::par, m_ImageHorizontalIter.begin(), m_ImageHorizontalIter.end(),
-				[this, y](uint32_t x) {
-					glm::vec4 color = PerPixel(x, y);
-					m_AccumulationData[x + y * m_FinalImage->GetWidth()] += color;
+		std::for_each(std::execution::par, m_ImageVerticalIter.begin(), m_ImageVerticalIter.end(),
+			[this](uint32_t y) {
+				std::for_each(std::execution::par, m_ImageHorizontalIter.begin(), m_ImageHorizontalIter.end(),
+					[this, y](uint32_t x) {
+						glm::vec4 color = PerPixel(x, y);
+						m_AccumulationData[x + y * m_FinalImage->GetWidth()] += color;
 
-					glm::vec4 accumulatedColor = m_AccumulationData[x + y * m_FinalImage->GetWidth()];
-					accumulatedColor /= (float)m_FrameIndex;
+						glm::vec4 accumulatedColor = m_AccumulationData[x + y * m_FinalImage->GetWidth()];
+						accumulatedColor /= (float)m_FrameIndex;
 
-					accumulatedColor = glm::clamp(accumulatedColor, glm::vec4(0.0f), glm::vec4(1.0f));
-					m_ImageData[x + y * m_FinalImage->GetWidth()] = Utils::ConvertToRGBA(accumulatedColor);
-				});
-		});
+						accumulatedColor = glm::clamp(accumulatedColor, glm::vec4(0.0f), glm::vec4(1.0f));
+						m_ImageData[x + y * m_FinalImage->GetWidth()] = Utils::ConvertToRGBA(accumulatedColor);
+					});
+			});
 #else
-	for (uint32_t y = 0; y < m_FinalImage->GetHeight(); y++) {
-		for (uint32_t x = 0; x < m_FinalImage->GetWidth(); x++) {
-			glm::vec4 color = PerPixel(x, y);
-			m_AccumulationData[x + y * m_FinalImage->GetWidth()] += color;
+		for (uint32_t y = 0; y < m_FinalImage->GetHeight(); y++) {
+			for (uint32_t x = 0; x < m_FinalImage->GetWidth(); x++) {
+				glm::vec4 color = PerPixel(x, y);
+				m_AccumulationData[x + y * m_FinalImage->GetWidth()] += color;
 
-			glm::vec4 accumulatedColor = m_AccumulationData[x + y * m_FinalImage->GetWidth()];
-			accumulatedColor /= (float)m_FrameIndex;
+				glm::vec4 accumulatedColor = m_AccumulationData[x + y * m_FinalImage->GetWidth()];
+				accumulatedColor /= (float)m_FrameIndex;
 
-			accumulatedColor = glm::clamp(accumulatedColor, glm::vec4(0.0f), glm::vec4(1.0f));
-			m_ImageData[x + y * m_FinalImage->GetWidth()] = Utils::ConvertToRGBA(accumulatedColor);
+				accumulatedColor = glm::clamp(accumulatedColor, glm::vec4(0.0f), glm::vec4(1.0f));
+				m_ImageData[x + y * m_FinalImage->GetWidth()] = Utils::ConvertToRGBA(accumulatedColor);
+			}
 		}
-	}
 #endif
 
-	m_FinalImage->SetData(m_ImageData);
+		m_FinalImage->SetData(m_ImageData);
+	}
 
 	if (m_Settings.Accumulate)
 		m_FrameIndex++;
@@ -210,4 +217,22 @@ Renderer::HitPayload Renderer::Miss(const Ray& ray) {
 	Renderer::HitPayload payload;
 	payload.HitDistance = -0.1f;
 	return payload;
+}
+
+VkDescriptorSet Renderer::GetFinalImageDescriptorSet() const {
+	if (m_Settings.UseGPU)
+		return m_GpuPathTracer.GetDescriptorSet();
+	return m_FinalImage ? m_FinalImage->GetDescriptorSet() : nullptr;
+}
+
+uint32_t Renderer::GetFinalImageWidth() const {
+	if (m_Settings.UseGPU)
+		return m_GpuPathTracer.GetWidth();
+	return m_FinalImage ? m_FinalImage->GetWidth() : 0;
+}
+
+uint32_t Renderer::GetFinalImageHeight() const {
+	if (m_Settings.UseGPU)
+		return m_GpuPathTracer.GetHeight();
+	return m_FinalImage ? m_FinalImage->GetHeight() : 0;
 }

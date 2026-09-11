@@ -1,0 +1,194 @@
+#version 450
+
+// GPU port of the CPU path tracer in Renderer.cpp (Renderer::PerPixel / TraceRay / ClosestHit / Miss).
+// Keeps the same math, RNG, and 5-bounce loop so CPU and GPU output match.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(std140, binding = 0) uniform CameraData {
+	mat4 InverseProjection;
+	mat4 InverseView;
+	vec4 Position; // xyz used
+} u_Camera;
+
+struct Sphere {
+	vec4 PositionAndRadius; // xyz = position, w = radius
+	ivec4 MaterialIndex;    // x = material index
+};
+
+layout(std430, binding = 1) readonly buffer SphereBuffer {
+	Sphere Spheres[];
+};
+
+struct Material {
+	vec4 AlbedoRoughness;  // rgb = albedo, w = roughness
+	vec4 EmissionAndPower; // rgb = emission color, w = emission power
+	vec4 MetallicPad;      // x = metallic
+};
+
+layout(std430, binding = 2) readonly buffer MaterialBuffer {
+	Material Materials[];
+};
+
+layout(binding = 3, rgba32f) uniform image2D AccumulationImage;
+layout(binding = 4, rgba8) uniform image2D DisplayImage;
+
+layout(push_constant) uniform PushConstants {
+	uint Width;
+	uint Height;
+	uint FrameIndex;
+	uint SphereCount;
+	uint Bounces;
+} u_PC;
+
+// -- RNG: same PCG hash as Utils::PCG_Hash / RandomFloat / InUnitSphere in Renderer.cpp --
+
+uint PCGHash(uint input_)
+{
+	uint state = input_ * 747796405u + 2891336453u;
+	uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+	return (word >> 22u) ^ word;
+}
+
+float RandomFloat(inout uint seed)
+{
+	seed = PCGHash(seed);
+	return float(seed) / 4294967295.0; // uint32 max
+}
+
+vec3 RandomInUnitSphere(inout uint seed)
+{
+	return normalize(vec3(
+		RandomFloat(seed) * 2.0 - 1.0,
+		RandomFloat(seed) * 2.0 - 1.0,
+		RandomFloat(seed) * 2.0 - 1.0));
+}
+
+// -- Ray/scene intersection: same as Renderer::TraceRay / ClosestHit / Miss --
+
+struct HitPayload {
+	float HitDistance;
+	vec3 WorldPosition;
+	vec3 WorldNormal;
+	int ObjectIndex;
+};
+
+HitPayload Miss()
+{
+	HitPayload payload;
+	payload.HitDistance = -0.1;
+	payload.WorldPosition = vec3(0.0);
+	payload.WorldNormal = vec3(0.0);
+	payload.ObjectIndex = -1;
+	return payload;
+}
+
+HitPayload ClosestHit(vec3 rayOrigin, vec3 rayDirection, float hitDistance, int objectIndex)
+{
+	HitPayload payload;
+	payload.HitDistance = hitDistance;
+	payload.ObjectIndex = objectIndex;
+
+	vec3 spherePosition = Spheres[objectIndex].PositionAndRadius.xyz;
+
+	vec3 origin = rayOrigin - spherePosition;
+	payload.WorldPosition = origin + rayDirection * hitDistance;
+	payload.WorldNormal = normalize(payload.WorldPosition);
+
+	payload.WorldPosition += spherePosition;
+
+	return payload;
+}
+
+HitPayload TraceRay(vec3 rayOrigin, vec3 rayDirection)
+{
+	int closestSphere = -1;
+	float hitDistance = 3.402823466e+38; // FLT_MAX
+
+	for (uint i = 0u; i < u_PC.SphereCount; i++)
+	{
+		vec3 spherePosition = Spheres[i].PositionAndRadius.xyz;
+		float radius = Spheres[i].PositionAndRadius.w;
+
+		vec3 origin = rayOrigin - spherePosition;
+
+		float a = dot(rayDirection, rayDirection);
+		float b = 2.0 * dot(origin, rayDirection);
+		float c = dot(origin, origin) - radius * radius;
+
+		float discriminant = b * b - 4.0 * a * c;
+		if (discriminant < 0.0)
+			continue;
+
+		float closestT = (-b - sqrt(discriminant)) / (2.0 * a);
+		if (closestT > 0.0 && closestT < hitDistance)
+		{
+			hitDistance = closestT;
+			closestSphere = int(i);
+		}
+	}
+
+	if (closestSphere < 0)
+		return Miss();
+
+	return ClosestHit(rayOrigin, rayDirection, hitDistance, closestSphere);
+}
+
+vec3 PerPixel(uvec2 pixelCoord)
+{
+	vec2 coord = (vec2(pixelCoord) + vec2(0.5)) / vec2(u_PC.Width, u_PC.Height);
+	coord = coord * 2.0 - 1.0; // -1 -> 1
+
+	vec4 target = u_Camera.InverseProjection * vec4(coord.x, coord.y, 1.0, 1.0);
+	vec3 rayDirection = vec3(u_Camera.InverseView * vec4(normalize(vec3(target) / target.w), 0.0));
+	vec3 rayOrigin = u_Camera.Position.xyz;
+
+	vec3 light = vec3(0.0);
+	vec3 contribution = vec3(1.0);
+
+	uint seed = pixelCoord.x + pixelCoord.y * u_PC.Width;
+	seed *= u_PC.FrameIndex;
+
+	for (uint i = 0u; i < u_PC.Bounces; i++)
+	{
+		seed += i;
+
+		HitPayload payload = TraceRay(rayOrigin, rayDirection);
+		if (payload.HitDistance < 0.0)
+			break; // sky term intentionally unused, matching the CPU renderer
+
+		int materialIndex = Spheres[payload.ObjectIndex].MaterialIndex.x;
+		vec3 albedo = Materials[materialIndex].AlbedoRoughness.rgb;
+		vec3 emissionColor = Materials[materialIndex].EmissionAndPower.rgb;
+		float emissionPower = Materials[materialIndex].EmissionAndPower.w;
+
+		contribution *= albedo;
+		light += emissionColor * emissionPower;
+
+		rayOrigin = payload.WorldPosition + payload.WorldNormal * 0.0001;
+		rayDirection = normalize(payload.WorldNormal + RandomInUnitSphere(seed));
+	}
+
+	return light;
+}
+
+void main()
+{
+	uvec2 pixelCoord = gl_GlobalInvocationID.xy;
+	if (pixelCoord.x >= u_PC.Width || pixelCoord.y >= u_PC.Height)
+		return;
+
+	vec3 color = PerPixel(pixelCoord);
+
+	vec4 accumulatedColor;
+	if (u_PC.FrameIndex == 1u)
+		accumulatedColor = vec4(color, 1.0);
+	else
+		accumulatedColor = imageLoad(AccumulationImage, ivec2(pixelCoord)) + vec4(color, 1.0);
+
+	imageStore(AccumulationImage, ivec2(pixelCoord), accumulatedColor);
+
+	vec4 displayColor = accumulatedColor / float(u_PC.FrameIndex);
+	displayColor = clamp(displayColor, vec4(0.0), vec4(1.0));
+	imageStore(DisplayImage, ivec2(pixelCoord), displayColor);
+}
