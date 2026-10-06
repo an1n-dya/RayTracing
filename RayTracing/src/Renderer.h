@@ -4,6 +4,7 @@
 
 #include "Camera.h"
 #include "GpuPathTracer.h"
+#include "PreparedScene.h"
 #include "Ray.h"
 #include "RenderSettings.h"
 #include "Scene.h"
@@ -53,14 +54,8 @@ private:
 		glm::vec3 GeometricNormal; // true surface normal, used for offsets and deciding which side was hit
 
 		ObjectRef Object;
+		uint32_t Triangle; // within the mesh, for mesh instances
 		int MaterialIndex;
-	};
-
-	// Per-frame data derived from the scene (instance matrices)
-	struct InstanceData {
-		glm::mat4 ObjectToWorld;
-		glm::mat4 WorldToObject;
-		glm::mat3 NormalMatrix; // object -> world for normals
 	};
 
 	glm::vec4 PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex); // RayGen
@@ -73,6 +68,13 @@ private:
 	HitPayload ClosestHit(const Ray& ray, float hitDistance, const ObjectRef& object, uint32_t triangle, const glm::vec2& barycentrics);
 	HitPayload Miss(const Ray& ray);
 
+	// Next-event estimation: light arriving at origin straight from a randomly picked light, through the BSDF,
+	// MIS-weighted against BSDF sampling. Returns the contribution before multiplying by the path throughput.
+	glm::vec3 SampleDirectLight(const glm::vec3& origin, const glm::vec3& normal, const glm::vec3& geometricNormal,
+		const glm::vec3& wo, const Material& material, uint32_t& seed);
+	// Probability that light sampling from ray.Origin would have produced the ray that found this hit (0 if not a light)
+	float LightPdf(const HitPayload& hit, const Ray& ray) const;
+
 	void RenderCPU(const FrameParams& frame);
 	void UpdateDifferenceImage();
 private:
@@ -84,7 +86,7 @@ private:
 
 	const Scene* m_ActiveScene = nullptr;
 	const Camera* m_ActiveCamera = nullptr;
-	std::vector<InstanceData> m_Instances; // parallel to m_ActiveScene->MeshInstances
+	PreparedScene m_Prepared; // instance matrices + light list for m_ActiveScene
 
 	uint32_t* m_ImageData = nullptr;
 	glm::vec4* m_AccumulationData = nullptr;

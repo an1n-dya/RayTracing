@@ -29,6 +29,7 @@ using namespace Walnut;
 //   --save-scene <file.json>   write the (loaded) scene back out; exits unless --render is given too
 //   --render <out.png|.hdr>    render until --samples <n> samples per pixel have accumulated, save, exit
 //   --cpu / --gpu              pick the render path
+//   --no-light-sampling        disable next-event estimation (for checking it doesn't change the result)
 //   --compare split|difference CPU vs GPU compare view
 struct AppOptions {
 	std::string ScenePath;
@@ -37,6 +38,7 @@ struct AppOptions {
 	int RenderSamples = 256;
 	int UseGPU = -1; // -1 = keep the default, 0 = --cpu, 1 = --gpu
 	CompareMode Compare = CompareMode::Off; // --compare split|difference
+	bool DisableLightSampling = false;
 };
 
 static AppOptions ParseCommandLine(int argc, char** argv) {
@@ -56,6 +58,8 @@ static AppOptions ParseCommandLine(int argc, char** argv) {
 			options.UseGPU = 1;
 		else if (strcmp(arg, "--cpu") == 0)
 			options.UseGPU = 0;
+		else if (strcmp(arg, "--no-light-sampling") == 0)
+			options.DisableLightSampling = true;
 		else if (strcmp(arg, "--compare") == 0 && hasValue) {
 			const char* mode = argv[++i];
 			options.Compare = strcmp(mode, "split") == 0 ? CompareMode::Split : strcmp(mode, "difference") == 0 ? CompareMode::Difference : CompareMode::Off;
@@ -82,6 +86,8 @@ public:
 		if (m_Options.UseGPU >= 0)
 			m_Renderer.GetSettings().UseGPU = m_Options.UseGPU == 1;
 		m_Renderer.GetSettings().Compare = m_Options.Compare;
+		if (m_Options.DisableLightSampling)
+			m_Renderer.GetSettings().LightSampling = false;
 		if (!m_Options.RenderOutputPath.empty())
 			m_Renderer.GetSettings().MaxSamples = m_Options.RenderSamples;
 
@@ -353,6 +359,7 @@ private:
 			changed |= ImGui::SliderInt("Samples / Frame", &settings.SamplesPerFrame, 1, 64);
 			changed |= ImGui::Checkbox("Anti-aliasing", &settings.AntiAliasing);
 			changed |= ImGui::SliderInt("Max Bounces", &settings.MaxBounces, 1, 64);
+			changed |= ImGui::Checkbox("Light Sampling (NEE + MIS)", &settings.LightSampling);
 			changed |= ImGui::Checkbox("Russian Roulette", &settings.RussianRoulette);
 			if (settings.RussianRoulette)
 				changed |= ImGui::SliderInt("RR Start Bounce", &settings.RussianRouletteStartBounce, 0, 16);

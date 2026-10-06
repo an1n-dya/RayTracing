@@ -3,6 +3,7 @@
 #include "BSDF.h"
 #include "ImageExport.h"
 #include "Intersection.h"
+#include "LightSampling.h"
 #include "ToneMapping.h"
 
 #include "Walnut/Random.h"
@@ -103,7 +104,7 @@ bool Renderer::Render(const Scene& scene, const Camera& camera) {
 	// Compare modes run both paths on exactly the same samples
 	bool comparing = m_Settings.Compare != CompareMode::Off;
 	if (m_Settings.UseGPU || comparing)
-		m_GpuPathTracer.Render(scene, camera, m_Settings, frame);
+		m_GpuPathTracer.Render(scene, m_Prepared, camera, m_Settings, frame);
 	if (!m_Settings.UseGPU || comparing)
 		RenderCPU(frame);
 	if (m_Settings.Compare == CompareMode::Difference)
@@ -142,6 +143,10 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex) {
 	glm::vec3 light(0.0f);
 	glm::vec3 contribution(1.0f);
 
+	bool lightSampling = m_Settings.LightSampling && !m_Prepared.Lights.empty();
+	float previousPdf = 0.0f;   // pdf of the BSDF sample that led to the current hit
+	bool previousDelta = true;  // ...or it came from a delta lobe / the camera, which light sampling can't produce
+
 	for (int i = 0; i < m_Settings.MaxBounces; i++) {
 		Renderer::HitPayload payload = TraceRay(ray);
 		if (payload.HitDistance < 0.0f) {
@@ -151,17 +156,34 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex) {
 
 		const Material& material = m_ActiveScene->Materials[payload.MaterialIndex];
 
-		// Emission is weighted by the throughput accumulated *before* this surface scatters the path
-		light += material.GetEmission() * contribution;
-
-		// Shade with the normals facing the incoming ray (a ray can hit a surface from behind, e.g. from inside glass)
+		// Only the front face of a surface emits (the side its normal points to)
 		glm::vec3 wo = -ray.Direction;
 		bool frontFace = glm::dot(payload.GeometricNormal, wo) >= 0.0f;
+
+		// Emission is weighted by the throughput accumulated *before* this surface scatters the path. If light
+		// sampling at the previous bounce could also have found this light, the two strategies share it via MIS.
+		glm::vec3 emission = material.GetEmission();
+		if (frontFace && (emission.r > 0.0f || emission.g > 0.0f || emission.b > 0.0f)) {
+			float weight = 1.0f;
+			if (lightSampling && !previousDelta) {
+				float lightPdf = LightPdf(payload, ray);
+				if (lightPdf > 0.0f)
+					weight = LightSampling::PowerHeuristic(previousPdf, lightPdf);
+			}
+			light += emission * contribution * weight;
+		}
+
+		// Shade with the normals facing the incoming ray (a ray can hit a surface from behind, e.g. from inside glass)
 		glm::vec3 geometricNormal = frontFace ? payload.GeometricNormal : -payload.GeometricNormal;
 		glm::vec3 normal = frontFace ? payload.WorldNormal : -payload.WorldNormal;
 		// Interpolated normals can face away from the viewer near silhouettes: use the true one there
 		if (glm::dot(normal, wo) <= 0.0f)
 			normal = geometricNormal;
+
+		// Not at the last bounce: the BSDF-sampled ray it competes with (via MIS) would never be traced.
+		// Pure glass has nothing light sampling could contribute to (its lobe is delta-like).
+		if (lightSampling && i + 1 < m_Settings.MaxBounces && BSDF::GlassWeight(material) < 1.0f)
+			light += contribution * SampleDirectLight(payload.WorldPosition + geometricNormal * 0.0001f, normal, geometricNormal, wo, material, seed);
 
 		// Draw the random numbers one at a time so the order matches the GPU path
 		glm::vec3 u;
@@ -177,6 +199,9 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex) {
 		if (!bsdfSample.Delta && !leavesAbove)
 			break;
 		contribution *= bsdfSample.Weight;
+
+		previousPdf = bsdfSample.Pdf;
+		previousDelta = bsdfSample.Delta;
 
 		// Nudge the origin off the surface, to whichever side the new ray leaves on (transmission goes through)
 		ray.Origin = payload.WorldPosition + geometricNormal * (leavesAbove ? 0.0001f : -0.0001f);
@@ -203,14 +228,71 @@ float Renderer::RandomFloat(uint32_t& seed) const {
 
 void Renderer::PrepareScene(const Scene& scene) {
 	m_ActiveScene = &scene;
+	m_Prepared.Prepare(scene);
+}
 
-	m_Instances.resize(scene.MeshInstances.size());
-	for (size_t i = 0; i < scene.MeshInstances.size(); i++) {
-		InstanceData& instance = m_Instances[i];
-		instance.ObjectToWorld = scene.MeshInstances[i].Transform.GetMatrix();
-		instance.WorldToObject = glm::inverse(instance.ObjectToWorld);
-		instance.NormalMatrix = glm::transpose(glm::mat3(instance.WorldToObject));
+glm::vec3 Renderer::SampleDirectLight(const glm::vec3& origin, const glm::vec3& normal, const glm::vec3& geometricNormal,
+	const glm::vec3& wo, const Material& material, uint32_t& seed)
+{
+	// Always draw all three numbers so the random sequence doesn't depend on what happens below
+	float uLight = RandomFloat(seed);
+	float u1 = RandomFloat(seed);
+	float u2 = RandomFloat(seed);
+
+	const PreparedScene::Light& light = m_Prepared.Lights[m_Prepared.SelectLight(uLight)];
+
+	glm::vec3 direction;
+	float pdf;
+	if (light.Type == PreparedScene::LightType::Sphere) {
+		if (!LightSampling::SampleSphere(origin, light.Position0, light.Radius, u1, u2, direction, pdf))
+			return glm::vec3(0.0f);
 	}
+	else {
+		float distance;
+		if (!LightSampling::SampleTriangle(origin, light.Position0, light.Position1, light.Position2, light.Normal, light.Area, u1, u2, direction, distance, pdf))
+			return glm::vec3(0.0f);
+	}
+
+	if (glm::dot(direction, geometricNormal) <= 0.0f)
+		return glm::vec3(0.0f); // the light is behind the surface
+
+	glm::vec3 f = BSDF::Evaluate(material, normal, wo, direction);
+	if (f.r <= 0.0f && f.g <= 0.0f && f.b <= 0.0f)
+		return glm::vec3(0.0f);
+
+	// Shadow ray: the light is visible if it's the first thing the ray hits
+	Ray shadowRay;
+	shadowRay.Origin = origin;
+	shadowRay.Direction = direction;
+	HitPayload hit = TraceRay(shadowRay);
+	bool visible = light.Type == PreparedScene::LightType::Sphere
+		? hit.Object == ObjectRef{ ObjectType::Sphere, (int)light.ObjectIndex }
+		: hit.Object == ObjectRef{ ObjectType::MeshInstance, (int)light.ObjectIndex } && hit.Triangle == light.Triangle;
+	if (!visible)
+		return glm::vec3(0.0f);
+
+	float lightPdf = light.Probability * pdf;
+	float weight = LightSampling::PowerHeuristic(lightPdf, BSDF::Pdf(material, normal, wo, direction));
+	return f * light.Emission * (weight / lightPdf);
+}
+
+float Renderer::LightPdf(const HitPayload& hit, const Ray& ray) const {
+	if (hit.Object.Type == ObjectType::Sphere) {
+		int lightIndex = m_Prepared.SphereLights[hit.Object.Index];
+		if (lightIndex < 0)
+			return 0.0f;
+		const PreparedScene::Light& light = m_Prepared.Lights[lightIndex];
+		return light.Probability * LightSampling::SpherePdf(ray.Origin, light.Position0, light.Radius);
+	}
+	if (hit.Object.Type == ObjectType::MeshInstance) {
+		int lightOffset = m_Prepared.InstanceLightOffsets[hit.Object.Index];
+		if (lightOffset < 0)
+			return 0.0f;
+		const PreparedScene::Light& light = m_Prepared.Lights[lightOffset + hit.Triangle];
+		float cosLight = glm::abs(glm::dot(hit.GeometricNormal, ray.Direction));
+		return light.Probability * LightSampling::TrianglePdf(hit.HitDistance, cosLight, light.Area);
+	}
+	return 0.0f; // planes aren't in the light list
 }
 
 Renderer::HitPayload Renderer::TraceRay(const Ray& ray) {
@@ -239,7 +321,7 @@ Renderer::HitPayload Renderer::TraceRay(const Ray& ray) {
 
 	for (size_t i = 0; i < scene.MeshInstances.size(); i++) {
 		const Mesh& mesh = scene.Meshes[scene.MeshInstances[i].MeshIndex];
-		const InstanceData& instance = m_Instances[i];
+		const PreparedScene::Instance& instance = m_Prepared.Instances[i];
 
 		// Intersect in object space. The direction isn't renormalized, so distances stay comparable with world space.
 		glm::vec3 origin = glm::vec3(instance.WorldToObject * glm::vec4(ray.Origin, 1.0f));
@@ -276,6 +358,7 @@ Renderer::HitPayload Renderer::ClosestHit(const Ray& ray, float hitDistance, con
 	Renderer::HitPayload payload;
 	payload.HitDistance = hitDistance;
 	payload.Object = object;
+	payload.Triangle = triangle;
 	payload.MaterialIndex = scene.GetMaterialIndex(object);
 	payload.WorldPosition = ray.Origin + ray.Direction * hitDistance;
 
@@ -290,7 +373,7 @@ Renderer::HitPayload Renderer::ClosestHit(const Ray& ray, float hitDistance, con
 		break;
 	case ObjectType::MeshInstance: {
 		const Mesh& mesh = scene.Meshes[scene.MeshInstances[object.Index].MeshIndex];
-		const InstanceData& instance = m_Instances[object.Index];
+		const PreparedScene::Instance& instance = m_Prepared.Instances[object.Index];
 		const Vertex& a = mesh.Vertices[mesh.Indices[triangle * 3 + 0]];
 		const Vertex& b = mesh.Vertices[mesh.Indices[triangle * 3 + 1]];
 		const Vertex& c = mesh.Vertices[mesh.Indices[triangle * 3 + 2]];

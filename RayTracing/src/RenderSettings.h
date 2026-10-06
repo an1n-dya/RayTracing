@@ -37,6 +37,7 @@ struct RenderSettings {
 	bool AntiAliasing = true; // jitter each sample within its pixel (off = always the pixel center)
 
 	int MaxBounces = 5;
+	bool LightSampling = true; // next-event estimation: also aim a ray at a light at every bounce (with MIS)
 	bool RussianRoulette = true;
 	int RussianRouletteStartBounce = 3; // paths are never terminated before this bounce
 

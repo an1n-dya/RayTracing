@@ -26,6 +26,8 @@ namespace {
 			Instances = 6,         // SSBO: mesh instances
 			Vertices = 7,          // SSBO: all meshes' vertices
 			Indices = 8,           // SSBO: all meshes' triangles (global vertex indices)
+			Lights = 9,            // SSBO: PreparedScene::Lights
+			LightCDF = 10,         // SSBO: PreparedScene::LightCDF
 			Count
 		};
 	}
@@ -40,12 +42,23 @@ namespace {
 		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 	};
 
 	// Mirrors the std430/std140 layouts declared in PathTrace.comp
 	struct SphereGPU {
 		glm::vec4 PositionAndRadius; // xyz = position, w = radius
-		glm::ivec4 MaterialIndex;    // x = material index
+		glm::ivec4 MaterialIndex;    // x = material index, y = light index (-1 if not emissive)
+	};
+
+	struct LightGPU {
+		glm::vec4 Position0;   // sphere center / triangle vertex 0; w = sphere radius
+		glm::vec4 Position1;   // triangle vertex 1; w = triangle area
+		glm::vec4 Position2;   // triangle vertex 2
+		glm::vec4 Normal;      // triangle front-face normal
+		glm::vec4 Emission;    // rgb = radiance, w = selection probability
+		glm::uvec4 Info;       // x = type (0 sphere, 1 triangle), y = object index, z = global triangle index
 	};
 
 	struct MaterialGPU {
@@ -65,7 +78,7 @@ namespace {
 		glm::mat4 WorldToObject;
 		glm::vec4 BoundsMin; // object space
 		glm::vec4 BoundsMax;
-		glm::uvec4 Info;     // x = first triangle, y = triangle count, z = material index
+		glm::uvec4 Info;     // x = first triangle, y = triangle count, z = material index, w = first light (~0u if none)
 	};
 
 	struct VertexGPU {
@@ -101,6 +114,8 @@ namespace {
 		uint32_t ResetAccumulation;
 		uint32_t PlaneCount;
 		uint32_t InstanceCount;
+		uint32_t LightCount;
+		uint32_t LightSampling;
 	};
 
 	uint32_t FindMemoryType(VkMemoryPropertyFlags properties, uint32_t typeBits)
@@ -243,7 +258,7 @@ GpuPathTracer::~GpuPathTracer()
 		ReleaseImages();
 
 	std::vector<Buffer> buffers = { m_FrameBuffer, m_SphereBuffer, m_MaterialBuffer, m_PlaneBuffer, m_InstanceBuffer,
-		m_VertexBuffer, m_IndexBuffer };
+		m_VertexBuffer, m_IndexBuffer, m_LightBuffer, m_LightCDFBuffer };
 
 	Walnut::Application::SubmitResourceFree([shaderModule = m_ShaderModule, pipeline = m_Pipeline,
 		pipelineLayout = m_PipelineLayout, descriptorSetLayout = m_DescriptorSetLayout, descriptorPool = m_DescriptorPool,
@@ -587,7 +602,7 @@ void GpuPathTracer::OnResize(uint32_t width, uint32_t height)
 	m_Height = height;
 }
 
-void GpuPathTracer::Render(const Scene& scene, const Camera& camera, const RenderSettings& settings, const FrameParams& frame)
+void GpuPathTracer::Render(const Scene& scene, const PreparedScene& prepared, const Camera& camera, const RenderSettings& settings, const FrameParams& frame)
 {
 	if (!m_Initialized || m_Width == 0 || m_Height == 0)
 		return;
@@ -606,7 +621,7 @@ void GpuPathTracer::Render(const Scene& scene, const Camera& camera, const Rende
 	for (size_t i = 0; i < spheres.size(); i++)
 	{
 		spheres[i].PositionAndRadius = glm::vec4(scene.Spheres[i].Position, scene.Spheres[i].Radius);
-		spheres[i].MaterialIndex = glm::ivec4(scene.Spheres[i].MaterialIndex, 0, 0, 0);
+		spheres[i].MaterialIndex = glm::ivec4(scene.Spheres[i].MaterialIndex, prepared.SphereLights[i], 0, 0);
 	}
 	Upload(m_SphereBuffer, Binding::Spheres, BindingTypes[Binding::Spheres], spheres.data(), spheres.size() * sizeof(SphereGPU));
 
@@ -636,13 +651,31 @@ void GpuPathTracer::Render(const Scene& scene, const Camera& camera, const Rende
 	{
 		const MeshInstance& instance = scene.MeshInstances[i];
 		const Mesh& mesh = scene.Meshes[instance.MeshIndex];
-		instances[i].ObjectToWorld = instance.Transform.GetMatrix();
-		instances[i].WorldToObject = glm::inverse(instances[i].ObjectToWorld);
+		instances[i].ObjectToWorld = prepared.Instances[i].ObjectToWorld;
+		instances[i].WorldToObject = prepared.Instances[i].WorldToObject;
 		instances[i].BoundsMin = glm::vec4(mesh.BoundsMin, 0.0f);
 		instances[i].BoundsMax = glm::vec4(mesh.BoundsMax, 0.0f);
-		instances[i].Info = glm::uvec4(m_MeshFirstTriangle[instance.MeshIndex], mesh.GetTriangleCount(), (uint32_t)instance.MaterialIndex, 0u);
+		instances[i].Info = glm::uvec4(m_MeshFirstTriangle[instance.MeshIndex], mesh.GetTriangleCount(), (uint32_t)instance.MaterialIndex,
+			(uint32_t)prepared.InstanceLightOffsets[i]); // -1 becomes ~0u
 	}
 	Upload(m_InstanceBuffer, Binding::Instances, BindingTypes[Binding::Instances], instances.data(), instances.size() * sizeof(InstanceGPU));
+
+	std::vector<LightGPU> lights(prepared.Lights.size());
+	for (size_t i = 0; i < lights.size(); i++)
+	{
+		const PreparedScene::Light& light = prepared.Lights[i];
+		lights[i].Position0 = glm::vec4(light.Position0, light.Radius);
+		lights[i].Position1 = glm::vec4(light.Position1, light.Area);
+		lights[i].Position2 = glm::vec4(light.Position2, 0.0f);
+		lights[i].Normal = glm::vec4(light.Normal, 0.0f);
+		lights[i].Emission = glm::vec4(light.Emission, light.Probability);
+		// The shader identifies triangles by their index in the concatenated index buffer
+		uint32_t globalTriangle = light.Type == PreparedScene::LightType::Triangle
+			? m_MeshFirstTriangle[scene.MeshInstances[light.ObjectIndex].MeshIndex] + light.Triangle : 0u;
+		lights[i].Info = glm::uvec4((uint32_t)light.Type, light.ObjectIndex, globalTriangle, 0u);
+	}
+	Upload(m_LightBuffer, Binding::Lights, BindingTypes[Binding::Lights], lights.data(), lights.size() * sizeof(LightGPU));
+	Upload(m_LightCDFBuffer, Binding::LightCDF, BindingTypes[Binding::LightCDF], prepared.LightCDF.data(), prepared.LightCDF.size() * sizeof(float));
 
 	PushConstants pushConstants{};
 	pushConstants.Width = m_Width;
@@ -660,6 +693,8 @@ void GpuPathTracer::Render(const Scene& scene, const Camera& camera, const Rende
 	pushConstants.AntiAliasing = settings.AntiAliasing ? 1u : 0u;
 	pushConstants.PlaneCount = (uint32_t)planes.size();
 	pushConstants.InstanceCount = (uint32_t)instances.size();
+	pushConstants.LightCount = (uint32_t)lights.size();
+	pushConstants.LightSampling = settings.LightSampling ? 1u : 0u;
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 

@@ -17,6 +17,7 @@ const int OBJECT_MESH_INSTANCE = 3;
 
 #include "BSDF.glsl"
 #include "Intersection.glsl"
+#include "LightSampling.glsl"
 
 layout(std140, binding = 0) uniform FrameData {
 	mat4 InverseProjection;
@@ -32,7 +33,7 @@ layout(std140, binding = 0) uniform FrameData {
 
 struct Sphere {
 	vec4 PositionAndRadius; // xyz = position, w = radius
-	ivec4 MaterialIndex;    // x = material index
+	ivec4 MaterialIndex;    // x = material index, y = light index (-1 if not emissive)
 };
 
 layout(std430, binding = 1) readonly buffer SphereBuffer {
@@ -67,7 +68,7 @@ struct MeshInstance {
 	mat4 WorldToObject;
 	vec4 BoundsMin; // object space
 	vec4 BoundsMax;
-	uvec4 Info;     // x = first triangle (in Indices / 3), y = triangle count, z = material index
+	uvec4 Info;     // x = first triangle (in Indices / 3), y = triangle count, z = material index, w = first light (~0u if none)
 };
 
 layout(std430, binding = 6) readonly buffer InstanceBuffer {
@@ -88,6 +89,27 @@ layout(std430, binding = 8) readonly buffer IndexBuffer {
 	uint Indices[];
 };
 
+// PreparedScene::Lights: emissive spheres and the triangles of emissive mesh instances
+struct Light {
+	vec4 Position0; // sphere center / triangle vertex 0; w = sphere radius
+	vec4 Position1; // triangle vertex 1; w = triangle area
+	vec4 Position2; // triangle vertex 2
+	vec4 Normal;    // triangle front-face normal (only the front emits)
+	vec4 Emission;  // rgb = radiance, w = selection probability
+	uvec4 Info;     // x = type (0 sphere, 1 triangle), y = object index, z = global triangle index
+};
+
+const uint LIGHT_SPHERE = 0u;
+const uint LIGHT_TRIANGLE = 1u;
+
+layout(std430, binding = 9) readonly buffer LightBuffer {
+	Light Lights[];
+};
+
+layout(std430, binding = 10) readonly buffer LightCDFBuffer {
+	float LightCDF[];
+};
+
 layout(push_constant) uniform PushConstants {
 	uint Width;
 	uint Height;
@@ -104,6 +126,8 @@ layout(push_constant) uniform PushConstants {
 	uint ResetAccumulation;
 	uint PlaneCount;
 	uint InstanceCount;
+	uint LightCount;
+	uint LightSampling; // next-event estimation with MIS
 } u_PC;
 
 // -- RNG: same PCG hash as Utils::PCG_Hash / RandomFloat in Renderer.cpp --
@@ -171,6 +195,7 @@ struct HitPayload {
 	vec3 GeometricNormal;
 	int ObjectType;
 	int ObjectIndex;
+	uint Triangle; // global triangle index, for mesh instances
 	int MaterialIndex;
 };
 
@@ -183,6 +208,7 @@ HitPayload Miss()
 	payload.GeometricNormal = vec3(0.0);
 	payload.ObjectType = OBJECT_NONE;
 	payload.ObjectIndex = -1;
+	payload.Triangle = 0u;
 	payload.MaterialIndex = 0;
 	return payload;
 }
@@ -193,6 +219,7 @@ HitPayload ClosestHit(vec3 rayOrigin, vec3 rayDirection, float hitDistance, int 
 	payload.HitDistance = hitDistance;
 	payload.ObjectType = objectType;
 	payload.ObjectIndex = objectIndex;
+	payload.Triangle = triangle;
 	payload.WorldPosition = rayOrigin + rayDirection * hitDistance;
 
 	if (objectType == OBJECT_SPHERE)
@@ -292,6 +319,85 @@ HitPayload TraceRay(vec3 rayOrigin, vec3 rayDirection)
 	return ClosestHit(rayOrigin, rayDirection, hitDistance, hitType, hitIndex, hitTriangle, hitBarycentrics);
 }
 
+// -- Light sampling: same as Renderer::SampleDirectLight / LightPdf --
+
+uint SelectLight(float u)
+{
+	uint low = 0u, high = u_PC.LightCount - 1u;
+	while (low < high)
+	{
+		uint middle = (low + high) / 2u;
+		if (u < LightCDF[middle])
+			high = middle;
+		else
+			low = middle + 1u;
+	}
+	return low;
+}
+
+vec3 SampleDirectLight(vec3 origin, vec3 normal, vec3 geometricNormal, vec3 wo, SurfaceMaterial material, inout uint seed)
+{
+	float uLight = RandomFloat(seed);
+	float u1 = RandomFloat(seed);
+	float u2 = RandomFloat(seed);
+
+	Light light = Lights[SelectLight(uLight)];
+
+	vec3 direction;
+	float pdf;
+	if (light.Info.x == LIGHT_SPHERE)
+	{
+		if (!SampleSphereLight(origin, light.Position0.xyz, light.Position0.w, u1, u2, direction, pdf))
+			return vec3(0.0);
+	}
+	else
+	{
+		float distance;
+		if (!SampleTriangleLight(origin, light.Position0.xyz, light.Position1.xyz, light.Position2.xyz, light.Normal.xyz, light.Position1.w, u1, u2, direction, distance, pdf))
+			return vec3(0.0);
+	}
+
+	if (dot(direction, geometricNormal) <= 0.0)
+		return vec3(0.0);
+
+	vec3 f = EvaluateBSDF(material, normal, wo, direction);
+	if (f.r <= 0.0 && f.g <= 0.0 && f.b <= 0.0)
+		return vec3(0.0);
+
+	HitPayload hit = TraceRay(origin, direction);
+	bool visible = light.Info.x == LIGHT_SPHERE
+		? (hit.ObjectType == OBJECT_SPHERE && hit.ObjectIndex == int(light.Info.y))
+		: (hit.ObjectType == OBJECT_MESH_INSTANCE && hit.ObjectIndex == int(light.Info.y) && hit.Triangle == light.Info.z);
+	if (!visible)
+		return vec3(0.0);
+
+	float lightPdf = light.Emission.w * pdf;
+	float weight = PowerHeuristic(lightPdf, PdfBSDF(material, normal, wo, direction));
+	return f * light.Emission.rgb * (weight / lightPdf);
+}
+
+float LightPdf(HitPayload hit, vec3 rayOrigin, vec3 rayDirection)
+{
+	if (hit.ObjectType == OBJECT_SPHERE)
+	{
+		int lightIndex = Spheres[hit.ObjectIndex].MaterialIndex.y;
+		if (lightIndex < 0)
+			return 0.0;
+		Light light = Lights[lightIndex];
+		return light.Emission.w * SphereLightPdf(rayOrigin, light.Position0.xyz, light.Position0.w);
+	}
+	if (hit.ObjectType == OBJECT_MESH_INSTANCE)
+	{
+		uint lightOffset = Instances[hit.ObjectIndex].Info.w;
+		if (lightOffset == 0xffffffffu)
+			return 0.0;
+		Light light = Lights[lightOffset + (hit.Triangle - Instances[hit.ObjectIndex].Info.x)];
+		float cosLight = abs(dot(hit.GeometricNormal, rayDirection));
+		return light.Emission.w * TriangleLightPdf(hit.HitDistance, cosLight, light.Position1.w);
+	}
+	return 0.0;
+}
+
 vec3 PerPixel(uvec2 pixelCoord, uint sampleIndex)
 {
 	// Decorrelate pixels and samples: every (pixel, sample) pair gets its own random stream
@@ -333,6 +439,10 @@ vec3 PerPixel(uvec2 pixelCoord, uint sampleIndex)
 	vec3 light = vec3(0.0);
 	vec3 contribution = vec3(1.0);
 
+	bool lightSampling = u_PC.LightSampling != 0u && u_PC.LightCount > 0u;
+	float previousPdf = 0.0;
+	bool previousDelta = true;
+
 	for (uint i = 0u; i < u_PC.Bounces; i++)
 	{
 		HitPayload payload = TraceRay(rayOrigin, rayDirection);
@@ -352,16 +462,34 @@ vec3 PerPixel(uvec2 pixelCoord, uint sampleIndex)
 		vec3 emissionColor = Materials[materialIndex].EmissionAndPower.rgb;
 		float emissionPower = Materials[materialIndex].EmissionAndPower.w;
 
-		// Emission is weighted by the throughput accumulated *before* this surface scatters the path
-		light += emissionColor * emissionPower * contribution;
-
-		// Shade with the normals facing the incoming ray (a ray can hit a surface from behind, e.g. from inside glass)
+		// Only the front face of a surface emits (the side its normal points to)
 		vec3 wo = -rayDirection;
 		bool frontFace = dot(payload.GeometricNormal, wo) >= 0.0;
+
+		// Emission is weighted by the throughput accumulated *before* this surface scatters the path,
+		// and shared with light sampling via MIS when that could have found it too
+		vec3 emission = emissionColor * emissionPower;
+		if (frontFace && (emission.r > 0.0 || emission.g > 0.0 || emission.b > 0.0))
+		{
+			float weight = 1.0;
+			if (lightSampling && !previousDelta)
+			{
+				float lightPdf = LightPdf(payload, rayOrigin, rayDirection);
+				if (lightPdf > 0.0)
+					weight = PowerHeuristic(previousPdf, lightPdf);
+			}
+			light += emission * contribution * weight;
+		}
+
+		// Shade with the normals facing the incoming ray (a ray can hit a surface from behind, e.g. from inside glass)
 		vec3 geometricNormal = frontFace ? payload.GeometricNormal : -payload.GeometricNormal;
 		vec3 normal = frontFace ? payload.WorldNormal : -payload.WorldNormal;
 		if (dot(normal, wo) <= 0.0)
 			normal = geometricNormal;
+
+		// Not at the last bounce (its MIS partner would never be traced), nor for pure glass
+		if (lightSampling && i + 1u < u_PC.Bounces && GlassWeight(material) < 1.0)
+			light += contribution * SampleDirectLight(payload.WorldPosition + geometricNormal * 0.0001, normal, geometricNormal, wo, material, seed);
 
 		vec3 u;
 		u.x = RandomFloat(seed);
@@ -376,6 +504,9 @@ vec3 PerPixel(uvec2 pixelCoord, uint sampleIndex)
 		if (!bsdfSample.Delta && !leavesAbove)
 			break;
 		contribution *= bsdfSample.Weight;
+
+		previousPdf = bsdfSample.Pdf;
+		previousDelta = bsdfSample.Delta;
 
 		// Nudge the origin off the surface, to whichever side the new ray leaves on
 		rayOrigin = payload.WorldPosition + geometricNormal * (leavesAbove ? 0.0001 : -0.0001);

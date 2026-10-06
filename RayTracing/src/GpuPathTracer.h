@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Camera.h"
+#include "PreparedScene.h"
 #include "RenderSettings.h"
 #include "Scene.h"
 
@@ -25,7 +26,7 @@ public:
 
 	void OnResize(uint32_t width, uint32_t height);
 	// frame.SampleCount = 0 skips path tracing and only re-resolves the accumulated image to the display image
-	void Render(const Scene& scene, const Camera& camera, const RenderSettings& settings, const FrameParams& frame);
+	void Render(const Scene& scene, const PreparedScene& prepared, const Camera& camera, const RenderSettings& settings, const FrameParams& frame);
 
 	// Synchronous GPU -> CPU copies of the current images (rows bottom-up, like the CPU path's buffers)
 	void ReadDisplayImage(std::vector<uint32_t>& pixels);        // tone mapped RGBA8
@@ -81,6 +82,8 @@ private:
 	Buffer m_MaterialBuffer;
 	Buffer m_PlaneBuffer;
 	Buffer m_InstanceBuffer;
+	Buffer m_LightBuffer;
+	Buffer m_LightCDFBuffer;
 
 	// Mesh geometry, only re-uploaded when Scene::GeometryVersion changes
 	Buffer m_VertexBuffer;
