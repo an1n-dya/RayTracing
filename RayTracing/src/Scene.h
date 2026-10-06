@@ -2,9 +2,12 @@
 
 #include "glm/glm.hpp"
 
+#include <string>
 #include <vector>
 
 struct Material {
+	std::string Name = "Material";
+
 	glm::vec3 Albedo{ 1.0f };
 	float Roughness = 1.0f;
 	float Metallic = 0.0f;
@@ -40,8 +43,34 @@ struct SkySettings {
 	}
 };
 
+// Identifies one object in a Scene (e.g. the editor's selection, or what a ray hit)
+enum class ObjectType : int {
+	None = 0,
+	Sphere,
+};
+
+struct ObjectRef {
+	ObjectType Type = ObjectType::None;
+	int Index = -1;
+
+	bool IsValid() const { return Type != ObjectType::None && Index >= 0; }
+	bool operator==(const ObjectRef& other) const { return Type == other.Type && Index == other.Index; }
+	bool operator!=(const ObjectRef& other) const { return !(*this == other); }
+};
+
 struct Scene{
 	std::vector<Sphere> Spheres;
 	std::vector<Material> Materials;
 	SkySettings Sky;
+
+	bool IsValid(const ObjectRef& object) const;
+
+	// Returns the new object; copies of existing objects are offset slightly so they're visible
+	ObjectRef AddSphere();
+	ObjectRef Duplicate(const ObjectRef& object);
+	void Remove(const ObjectRef& object);
+
+	int AddMaterial(const Material& material = Material());
+	// Objects using the removed material fall back to material 0; the last material can't be removed
+	void RemoveMaterial(int index);
 };

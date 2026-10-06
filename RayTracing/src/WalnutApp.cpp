@@ -54,15 +54,66 @@ public:
 		if (!m_Options.RenderOutputPath.empty())
 			m_Renderer.GetSettings().MaxSamples = m_Options.RenderSamples;
 
+		CreateDefaultScene();
+	}
+
+	virtual void OnUpdate(float ts) override {
+		if (m_Camera.OnUpdate(ts))
+			m_Renderer.ResetFrameIndex();
+	}
+
+	virtual void OnUIRender() override {
+		m_SceneChanged = false;
+
+		DrawSettingsPanel();
+		DrawScenePanel();
+		DrawMaterialsPanel();
+		DrawEnvironmentPanel();
+
+		// Any edit invalidates the samples accumulated so far
+		if (m_SceneChanged)
+			m_Renderer.ResetFrameIndex();
+
+		DrawViewport();
+
+		Render();
+
+		// Batch mode (--render): save once the requested number of samples has accumulated, then quit
+		if (!m_Options.RenderOutputPath.empty() && m_Renderer.IsConverged()) {
+			bool saved = m_Renderer.SaveImage(m_Options.RenderOutputPath);
+			printf("%s %s (%u spp, %ux%u, %s)\n", saved ? "Saved" : "FAILED to save", m_Options.RenderOutputPath.c_str(),
+				m_Renderer.GetSampleCount(), m_Renderer.GetFinalImageWidth(), m_Renderer.GetFinalImageHeight(),
+				m_Renderer.GetSettings().UseGPU ? "GPU" : "CPU");
+			m_Options.RenderOutputPath.clear();
+			Application::Get().Close();
+		}
+	}
+
+	void OnMenuBar() {
+		if (ImGui::BeginMenu("File")) {
+			if (ImGui::MenuItem("Export Image..."))
+				ExportImage();
+			ImGui::Separator();
+			if (ImGui::MenuItem("Exit"))
+				Application::Get().Close();
+			ImGui::EndMenu();
+		}
+	}
+
+private:
+	void CreateDefaultScene() {
 		Material& pinkSphere = m_Scene.Materials.emplace_back();
+		pinkSphere.Name = "Pink";
 		pinkSphere.Albedo = { 1.0f, 0.0f, 1.0f };
 		pinkSphere.Roughness = 0.0f;
 
 		Material& blueSphere = m_Scene.Materials.emplace_back();
+		blueSphere.Name = "Blue";
 		blueSphere.Albedo = { 0.2f, 0.3f, 1.0f };
 		blueSphere.Roughness = 0.1f;
 
 		Material& orangeSphere = m_Scene.Materials.emplace_back();
+		orangeSphere.Name = "Orange Light";
 		orangeSphere.Albedo = { 0.8f, 0.5f, 0.2f };
 		orangeSphere.Roughness = 0.1f;
 		orangeSphere.EmissionColor = orangeSphere.Albedo;
@@ -80,7 +131,7 @@ public:
 			Sphere sphere;
 			sphere.Position = { 0.0f, -101.0f, 0.0f };
 			sphere.Radius = 100.0f;
-			sphere.MaterialIndex = 1;	
+			sphere.MaterialIndex = 1;
 			m_Scene.Spheres.push_back(sphere);
 		}
 
@@ -93,12 +144,7 @@ public:
 		}
 	}
 
-	virtual void OnUpdate(float ts) override {
-		if (m_Camera.OnUpdate(ts))
-			m_Renderer.ResetFrameIndex();
-	}
-
-	virtual void OnUIRender() override {
+	void DrawSettingsPanel() {
 		ImGui::Begin("Settings");
 		ImGui::Text("Last render: %.3fms (%.1f FPS)", m_LastRenderTime, m_FPS);
 		if (m_Renderer.GetSettings().MaxSamples > 0)
@@ -174,67 +220,162 @@ public:
 		}
 
 		ImGui::End();
+	}
 
-		bool sceneChanged = false;
+	static std::string GetObjectLabel(const Scene& scene, const ObjectRef& object) {
+		char label[128];
+		switch (object.Type) {
+		case ObjectType::Sphere: {
+			const Sphere& sphere = scene.Spheres[object.Index];
+			snprintf(label, sizeof(label), "Sphere %d (%s)", object.Index, scene.Materials[sphere.MaterialIndex].Name.c_str());
+			break;
+		}
+		default:
+			snprintf(label, sizeof(label), "?");
+			break;
+		}
+		return label;
+	}
 
+	// Scene panel: the object list plus the selected object's properties
+	void DrawScenePanel() {
 		ImGui::Begin("Scene");
-		for (size_t i = 0; i < m_Scene.Spheres.size(); i++) {
+
+		if (ImGui::Button("Add Sphere")) {
+			m_Selection = m_Scene.AddSphere();
+			m_SceneChanged = true;
+		}
+
+		if (ImGui::BeginListBox("##Objects", ImVec2(-FLT_MIN, 8 * ImGui::GetTextLineHeightWithSpacing()))) {
+			for (int i = 0; i < (int)m_Scene.Spheres.size(); i++) {
+				ObjectRef object{ ObjectType::Sphere, i };
+				ImGui::PushID(i);
+				if (ImGui::Selectable(GetObjectLabel(m_Scene, object).c_str(), m_Selection == object))
+					m_Selection = object;
+				ImGui::PopID();
+			}
+			ImGui::EndListBox();
+		}
+
+		if (!m_Scene.IsValid(m_Selection))
+			m_Selection = {};
+
+		if (m_Selection.IsValid()) {
+			ImGui::Separator();
+			ImGui::TextUnformatted(GetObjectLabel(m_Scene, m_Selection).c_str());
+
+			if (m_Selection.Type == ObjectType::Sphere) {
+				Sphere& sphere = m_Scene.Spheres[m_Selection.Index];
+				m_SceneChanged |= ImGui::DragFloat3("Position", glm::value_ptr(sphere.Position), 0.1f);
+				if (ImGui::DragFloat("Radius", &sphere.Radius, 0.01f, 0.001f, 10000.0f)) {
+					sphere.Radius = std::max(sphere.Radius, 0.001f);
+					m_SceneChanged = true;
+				}
+				m_SceneChanged |= MaterialCombo("Material", sphere.MaterialIndex);
+			}
+
+			if (ImGui::Button("Duplicate")) {
+				m_Selection = m_Scene.Duplicate(m_Selection);
+				m_SceneChanged = true;
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Delete")) {
+				m_Scene.Remove(m_Selection);
+				m_Selection = {};
+				m_SceneChanged = true;
+			}
+		}
+
+		ImGui::End();
+	}
+
+	bool MaterialCombo(const char* label, int& materialIndex) {
+		bool changed = false;
+		if (ImGui::BeginCombo(label, m_Scene.Materials[materialIndex].Name.c_str())) {
+			for (int i = 0; i < (int)m_Scene.Materials.size(); i++) {
+				ImGui::PushID(i);
+				if (ImGui::Selectable(m_Scene.Materials[i].Name.c_str(), i == materialIndex)) {
+					materialIndex = i;
+					changed = true;
+				}
+				ImGui::PopID();
+			}
+			ImGui::EndCombo();
+		}
+		return changed;
+	}
+
+	void DrawMaterialsPanel() {
+		ImGui::Begin("Materials");
+
+		if (ImGui::Button("Add Material")) {
+			Material material;
+			material.Name = "Material " + std::to_string(m_Scene.Materials.size());
+			m_Scene.AddMaterial(material);
+		}
+
+		int materialToRemove = -1;
+		for (int i = 0; i < (int)m_Scene.Materials.size(); i++) {
 			ImGui::PushID(i);
 
-			Sphere& sphere = m_Scene.Spheres[i];
-			sceneChanged |= ImGui::DragFloat3("Position", glm::value_ptr(sphere.Position), 0.1f);
-			sceneChanged |= ImGui::DragFloat("Radius", &sphere.Radius, 0.1f);
-			sceneChanged |= ImGui::DragInt("Material", &sphere.MaterialIndex, 1.0f, 0, (int)m_Scene.Materials.size() - 1);
-
-			ImGui::Separator();
-
-			ImGui::PopID();
-		}
-
-		for (size_t i = 0; i < m_Scene.Materials.size(); i++) {
-			ImGui::PushID(i);		
-
 			Material& material = m_Scene.Materials[i];
-			sceneChanged |= ImGui::ColorEdit3("Albedo", glm::value_ptr(material.Albedo));
-			sceneChanged |= ImGui::DragFloat("Roughness", &material.Roughness, 0.05f, 0.0f, 1.0f);
-			sceneChanged |= ImGui::DragFloat("Metallic", &material.Metallic, 0.05f, 0.0f, 1.0f);
-			sceneChanged |= ImGui::ColorEdit3("Emission Color", glm::value_ptr(material.EmissionColor));
-			sceneChanged |= ImGui::DragFloat("Emission Power", &material.EmissionPower, 0.05f, 0.0f, FLT_MAX);
+			// "###" keeps the header's ID stable while its name is being edited
+			std::string header = material.Name + "###Material";
+			if (ImGui::CollapsingHeader(header.c_str())) {
+				char name[128];
+				snprintf(name, sizeof(name), "%s", material.Name.c_str());
+				if (ImGui::InputText("Name", name, sizeof(name)))
+					material.Name = name;
 
-			ImGui::Separator();
+				m_SceneChanged |= ImGui::ColorEdit3("Albedo", glm::value_ptr(material.Albedo));
+				m_SceneChanged |= ImGui::DragFloat("Roughness", &material.Roughness, 0.01f, 0.0f, 1.0f);
+				m_SceneChanged |= ImGui::DragFloat("Metallic", &material.Metallic, 0.01f, 0.0f, 1.0f);
+				m_SceneChanged |= ImGui::ColorEdit3("Emission Color", glm::value_ptr(material.EmissionColor));
+				m_SceneChanged |= ImGui::DragFloat("Emission Power", &material.EmissionPower, 0.05f, 0.0f, FLT_MAX);
+
+				ImGui::BeginDisabled(m_Scene.Materials.size() <= 1);
+				if (ImGui::Button("Delete Material"))
+					materialToRemove = i;
+				ImGui::EndDisabled();
+			}
 
 			ImGui::PopID();
 		}
 
-		ImGui::End();
-
-		ImGui::Begin("Environment");
-		{
-			SkySettings& sky = m_Scene.Sky;
-			const char* skyModes[] = { "None", "Gradient" };
-			int skyMode = (int)sky.Mode;
-			if (ImGui::Combo("Sky", &skyMode, skyModes, IM_ARRAYSIZE(skyModes))) {
-				sky.Mode = (SkyMode)skyMode;
-				sceneChanged = true;
-			}
-			if (sky.Mode == SkyMode::Gradient) {
-				sceneChanged |= ImGui::ColorEdit3("Top Color", glm::value_ptr(sky.TopColor));
-				sceneChanged |= ImGui::ColorEdit3("Bottom Color", glm::value_ptr(sky.BottomColor));
-			}
-			if (sky.Mode != SkyMode::None)
-				sceneChanged |= ImGui::DragFloat("Intensity", &sky.Intensity, 0.01f, 0.0f, 100.0f);
+		if (materialToRemove >= 0) {
+			m_Scene.RemoveMaterial(materialToRemove);
+			m_SceneChanged = true;
 		}
+
 		ImGui::End();
+	}
 
-		// Any edit invalidates the samples accumulated so far
-		if (sceneChanged)
-			m_Renderer.ResetFrameIndex();
+	void DrawEnvironmentPanel() {
+		ImGui::Begin("Environment");
 
+		SkySettings& sky = m_Scene.Sky;
+		const char* skyModes[] = { "None", "Gradient" };
+		int skyMode = (int)sky.Mode;
+		if (ImGui::Combo("Sky", &skyMode, skyModes, IM_ARRAYSIZE(skyModes))) {
+			sky.Mode = (SkyMode)skyMode;
+			m_SceneChanged = true;
+		}
+		if (sky.Mode == SkyMode::Gradient) {
+			m_SceneChanged |= ImGui::ColorEdit3("Top Color", glm::value_ptr(sky.TopColor));
+			m_SceneChanged |= ImGui::ColorEdit3("Bottom Color", glm::value_ptr(sky.BottomColor));
+		}
+		if (sky.Mode != SkyMode::None)
+			m_SceneChanged |= ImGui::DragFloat("Intensity", &sky.Intensity, 0.01f, 0.0f, 100.0f);
+
+		ImGui::End();
+	}
+
+	void DrawViewport() {
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
 		ImGui::Begin("Viewport");
 
-		m_ViewportWidth = ImGui::GetContentRegionAvail().x;
-		m_ViewportHeight = ImGui::GetContentRegionAvail().y;
+		m_ViewportWidth = (uint32_t)ImGui::GetContentRegionAvail().x;
+		m_ViewportHeight = (uint32_t)ImGui::GetContentRegionAvail().y;
 
 		VkDescriptorSet imageDescriptor = m_Renderer.GetFinalImageDescriptorSet();
 		if (imageDescriptor)
@@ -244,29 +385,6 @@ public:
 
 		ImGui::End();
 		ImGui::PopStyleVar();
-
-		Render();
-
-		// Batch mode (--render): save once the requested number of samples has accumulated, then quit
-		if (!m_Options.RenderOutputPath.empty() && m_Renderer.IsConverged()) {
-			bool saved = m_Renderer.SaveImage(m_Options.RenderOutputPath);
-			printf("%s %s (%u spp, %ux%u, %s)\n", saved ? "Saved" : "FAILED to save", m_Options.RenderOutputPath.c_str(),
-				m_Renderer.GetSampleCount(), m_Renderer.GetFinalImageWidth(), m_Renderer.GetFinalImageHeight(),
-				m_Renderer.GetSettings().UseGPU ? "GPU" : "CPU");
-			m_Options.RenderOutputPath.clear();
-			Application::Get().Close();
-		}
-	}
-
-	void OnMenuBar() {
-		if (ImGui::BeginMenu("File")) {
-			if (ImGui::MenuItem("Export Image..."))
-				ExportImage();
-			ImGui::Separator();
-			if (ImGui::MenuItem("Exit"))
-				Application::Get().Close();
-			ImGui::EndMenu();
-		}
 	}
 
 	void ExportImage() {
@@ -291,6 +409,9 @@ private:
 	Camera m_Camera;
 	Scene m_Scene;
 	uint32_t m_ViewportWidth = 0, m_ViewportHeight = 0;
+
+	ObjectRef m_Selection;
+	bool m_SceneChanged = false; // set by any edit during the current frame
 
 	float m_LastRenderTime = 0.0f;
 	float m_FPS = 0.0f;

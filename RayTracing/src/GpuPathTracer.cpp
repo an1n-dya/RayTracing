@@ -14,6 +14,26 @@
 
 namespace {
 
+	// Descriptor bindings - must match the layout(binding = N) declarations in PathTrace.comp
+	namespace Binding {
+		enum : uint32_t {
+			Frame = 0,             // UBO: camera + environment
+			Spheres = 1,           // SSBO
+			Materials = 2,         // SSBO
+			AccumulationImage = 3, // storage image, rgba32f
+			DisplayImage = 4,      // storage image, rgba8
+			Count
+		};
+	}
+
+	const VkDescriptorType BindingTypes[Binding::Count] = {
+		VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+		VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+	};
+
 	// Mirrors the std430/std140 layouts declared in PathTrace.comp
 	struct SphereGPU {
 		glm::vec4 PositionAndRadius; // xyz = position, w = radius
@@ -26,7 +46,7 @@ namespace {
 		glm::vec4 MetallicPad;      // x = metallic
 	};
 
-	struct CameraUBOData {
+	struct FrameUBOData {
 		glm::mat4 InverseProjection;
 		glm::mat4 InverseView;
 		glm::vec4 Position;
@@ -66,6 +86,8 @@ namespace {
 		return 0xffffffff;
 	}
 
+	// Host-visible + coherent buffer. Prefers memory that is also device-local (resizable BAR), which the
+	// shader can read at full speed, and falls back to plain host memory if there is none (or it's full).
 	void CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buffer, VkDeviceMemory& memory, void** mapped)
 	{
 		VkDevice device = Walnut::Application::GetDevice();
@@ -84,9 +106,16 @@ namespace {
 		VkMemoryAllocateInfo allocInfo{};
 		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
 		allocInfo.allocationSize = memReq.size;
-		allocInfo.memoryTypeIndex = FindMemoryType(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, memReq.memoryTypeBits);
-		err = vkAllocateMemory(device, &allocInfo, nullptr, &memory);
-		check_vk_result(err);
+
+		const VkMemoryPropertyFlags hostVisible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+		allocInfo.memoryTypeIndex = FindMemoryType(hostVisible | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memReq.memoryTypeBits);
+		err = allocInfo.memoryTypeIndex != 0xffffffff ? vkAllocateMemory(device, &allocInfo, nullptr, &memory) : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+		if (err != VK_SUCCESS)
+		{
+			allocInfo.memoryTypeIndex = FindMemoryType(hostVisible, memReq.memoryTypeBits);
+			err = vkAllocateMemory(device, &allocInfo, nullptr, &memory);
+			check_vk_result(err);
+		}
 
 		err = vkBindBufferMemory(device, buffer, memory, 0);
 		check_vk_result(err);
@@ -169,6 +198,11 @@ namespace {
 		return shaderModule;
 	}
 
+	VkBufferUsageFlags GetBufferUsage(VkDescriptorType type)
+	{
+		return type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT : VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+	}
+
 }
 
 GpuPathTracer::~GpuPathTracer()
@@ -176,14 +210,14 @@ GpuPathTracer::~GpuPathTracer()
 	if (!m_Initialized)
 		return;
 
-	if (m_AccumulationImage != VK_NULL_HANDLE)
+	if (m_AccumulationImage.Image != VK_NULL_HANDLE)
 		ReleaseImages();
+
+	std::vector<Buffer> buffers = { m_FrameBuffer, m_SphereBuffer, m_MaterialBuffer };
 
 	Walnut::Application::SubmitResourceFree([shaderModule = m_ShaderModule, pipeline = m_Pipeline,
 		pipelineLayout = m_PipelineLayout, descriptorSetLayout = m_DescriptorSetLayout, descriptorPool = m_DescriptorPool,
-		sampler = m_DisplaySampler, cameraUBO = m_CameraUBO, cameraUBOMemory = m_CameraUBOMemory,
-		sphereSSBO = m_SphereSSBO, sphereSSBOMemory = m_SphereSSBOMemory,
-		materialSSBO = m_MaterialSSBO, materialSSBOMemory = m_MaterialSSBOMemory]()
+		sampler = m_DisplaySampler, buffers]()
 	{
 		VkDevice device = Walnut::Application::GetDevice();
 
@@ -195,17 +229,14 @@ GpuPathTracer::~GpuPathTracer()
 		if (sampler != VK_NULL_HANDLE)
 			vkDestroySampler(device, sampler, nullptr);
 
-		vkUnmapMemory(device, cameraUBOMemory);
-		vkDestroyBuffer(device, cameraUBO, nullptr);
-		vkFreeMemory(device, cameraUBOMemory, nullptr);
-
-		vkUnmapMemory(device, sphereSSBOMemory);
-		vkDestroyBuffer(device, sphereSSBO, nullptr);
-		vkFreeMemory(device, sphereSSBOMemory, nullptr);
-
-		vkUnmapMemory(device, materialSSBOMemory);
-		vkDestroyBuffer(device, materialSSBO, nullptr);
-		vkFreeMemory(device, materialSSBOMemory, nullptr);
+		for (const Buffer& buffer : buffers)
+		{
+			if (buffer.Handle == VK_NULL_HANDLE)
+				continue;
+			vkUnmapMemory(device, buffer.Memory);
+			vkDestroyBuffer(device, buffer.Handle, nullptr);
+			vkFreeMemory(device, buffer.Memory, nullptr);
+		}
 	});
 }
 
@@ -216,16 +247,13 @@ void GpuPathTracer::Init()
 	auto shaderCode = ReadFile("src/shaders/PathTrace.comp.spv");
 	m_ShaderModule = CreateShaderModule(shaderCode);
 
-	VkDescriptorSetLayoutBinding bindings[5]{};
-	bindings[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-	bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-	bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-	bindings[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-	bindings[4] = { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+	VkDescriptorSetLayoutBinding bindings[Binding::Count]{};
+	for (uint32_t i = 0; i < Binding::Count; i++)
+		bindings[i] = { i, BindingTypes[i], 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
 	VkDescriptorSetLayoutCreateInfo layoutInfo{};
 	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	layoutInfo.bindingCount = 5;
+	layoutInfo.bindingCount = Binding::Count;
 	layoutInfo.pBindings = bindings;
 	VkResult err = vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_DescriptorSetLayout);
 	check_vk_result(err);
@@ -257,16 +285,22 @@ void GpuPathTracer::Init()
 	err = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline);
 	check_vk_result(err);
 
-	VkDescriptorPoolSize poolSizes[3]{};
-	poolSizes[0] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };
-	poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
-	poolSizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 };
+	// One pool entry per binding of each type
+	std::vector<VkDescriptorPoolSize> poolSizes;
+	for (VkDescriptorType type : BindingTypes)
+	{
+		auto it = std::find_if(poolSizes.begin(), poolSizes.end(), [type](const VkDescriptorPoolSize& size) { return size.type == type; });
+		if (it != poolSizes.end())
+			it->descriptorCount++;
+		else
+			poolSizes.push_back({ type, 1 });
+	}
 
 	VkDescriptorPoolCreateInfo poolInfo{};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	poolInfo.maxSets = 1;
-	poolInfo.poolSizeCount = 3;
-	poolInfo.pPoolSizes = poolSizes;
+	poolInfo.poolSizeCount = (uint32_t)poolSizes.size();
+	poolInfo.pPoolSizes = poolSizes.data();
 	err = vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_DescriptorPool);
 	check_vk_result(err);
 
@@ -278,74 +312,91 @@ void GpuPathTracer::Init()
 	err = vkAllocateDescriptorSets(device, &dsAllocInfo, &m_DescriptorSet);
 	check_vk_result(err);
 
-	CreateBuffer(sizeof(CameraUBOData), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, m_CameraUBO, m_CameraUBOMemory, &m_CameraUBOMapped);
-	CreateBuffer(MaxSpheres * sizeof(SphereGPU), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, m_SphereSSBO, m_SphereSSBOMemory, &m_SphereSSBOMapped);
-	CreateBuffer(MaxMaterials * sizeof(MaterialGPU), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, m_MaterialSSBO, m_MaterialSSBOMemory, &m_MaterialSSBOMapped);
-
-	VkDescriptorBufferInfo cameraBufferInfo{ m_CameraUBO, 0, sizeof(CameraUBOData) };
-	VkDescriptorBufferInfo sphereBufferInfo{ m_SphereSSBO, 0, MaxSpheres * sizeof(SphereGPU) };
-	VkDescriptorBufferInfo materialBufferInfo{ m_MaterialSSBO, 0, MaxMaterials * sizeof(MaterialGPU) };
-
-	VkWriteDescriptorSet writes[3]{};
-	writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-	writes[0].dstSet = m_DescriptorSet;
-	writes[0].dstBinding = 0;
-	writes[0].descriptorCount = 1;
-	writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-	writes[0].pBufferInfo = &cameraBufferInfo;
-
-	writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-	writes[1].dstSet = m_DescriptorSet;
-	writes[1].dstBinding = 1;
-	writes[1].descriptorCount = 1;
-	writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	writes[1].pBufferInfo = &sphereBufferInfo;
-
-	writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-	writes[2].dstSet = m_DescriptorSet;
-	writes[2].dstBinding = 2;
-	writes[2].descriptorCount = 1;
-	writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	writes[2].pBufferInfo = &materialBufferInfo;
-
-	vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
-
 	m_Initialized = true;
+}
+
+void GpuPathTracer::Upload(Buffer& buffer, uint32_t binding, VkDescriptorType type, const void* data, VkDeviceSize size)
+{
+	// Zero-sized buffers are invalid, and every binding must stay valid even when e.g. the scene has no spheres
+	VkDeviceSize requiredSize = std::max<VkDeviceSize>(size, 256);
+
+	if (buffer.Handle == VK_NULL_HANDLE || buffer.Size < requiredSize)
+	{
+		if (buffer.Handle != VK_NULL_HANDLE)
+		{
+			Walnut::Application::SubmitResourceFree([old = buffer]()
+			{
+				VkDevice device = Walnut::Application::GetDevice();
+				vkUnmapMemory(device, old.Memory);
+				vkDestroyBuffer(device, old.Handle, nullptr);
+				vkFreeMemory(device, old.Memory, nullptr);
+			});
+		}
+
+		buffer.Size = std::max(requiredSize, buffer.Size * 2); // grow geometrically so adding objects one by one stays cheap
+		CreateBuffer(buffer.Size, GetBufferUsage(type), buffer.Handle, buffer.Memory, &buffer.Mapped);
+		WriteBufferDescriptor(binding, type, buffer);
+	}
+
+	if (size > 0)
+		memcpy(buffer.Mapped, data, (size_t)size);
+}
+
+void GpuPathTracer::WriteBufferDescriptor(uint32_t binding, VkDescriptorType type, const Buffer& buffer)
+{
+	VkDescriptorBufferInfo bufferInfo{ buffer.Handle, 0, buffer.Size };
+
+	VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+	write.dstSet = m_DescriptorSet;
+	write.dstBinding = binding;
+	write.descriptorCount = 1;
+	write.descriptorType = type;
+	write.pBufferInfo = &bufferInfo;
+	vkUpdateDescriptorSets(Walnut::Application::GetDevice(), 1, &write, 0, nullptr);
+}
+
+void GpuPathTracer::WriteImageDescriptor(uint32_t binding, VkImageView view)
+{
+	VkDescriptorImageInfo imageInfo{ VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL };
+
+	VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+	write.dstSet = m_DescriptorSet;
+	write.dstBinding = binding;
+	write.descriptorCount = 1;
+	write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+	write.pImageInfo = &imageInfo;
+	vkUpdateDescriptorSets(Walnut::Application::GetDevice(), 1, &write, 0, nullptr);
 }
 
 void GpuPathTracer::ReleaseImages()
 {
-	Walnut::Application::SubmitResourceFree([accumImage = m_AccumulationImage, accumMemory = m_AccumulationImageMemory,
-		accumView = m_AccumulationImageView, displayImage = m_DisplayImage, displayMemory = m_DisplayImageMemory,
-		displayView = m_DisplayImageView]()
+	Walnut::Application::SubmitResourceFree([accumulation = m_AccumulationImage, display = m_DisplayImage]()
 	{
 		VkDevice device = Walnut::Application::GetDevice();
-		vkDestroyImageView(device, accumView, nullptr);
-		vkDestroyImage(device, accumImage, nullptr);
-		vkFreeMemory(device, accumMemory, nullptr);
-		vkDestroyImageView(device, displayView, nullptr);
-		vkDestroyImage(device, displayImage, nullptr);
-		vkFreeMemory(device, displayMemory, nullptr);
+		for (const StorageImage& image : { accumulation, display })
+		{
+			vkDestroyImageView(device, image.View, nullptr);
+			vkDestroyImage(device, image.Image, nullptr);
+			vkFreeMemory(device, image.Memory, nullptr);
+		}
 	});
 
-	m_AccumulationImage = VK_NULL_HANDLE;
-	m_AccumulationImageMemory = VK_NULL_HANDLE;
-	m_AccumulationImageView = VK_NULL_HANDLE;
-	m_DisplayImage = VK_NULL_HANDLE;
-	m_DisplayImageMemory = VK_NULL_HANDLE;
-	m_DisplayImageView = VK_NULL_HANDLE;
+	m_AccumulationImage = {};
+	m_DisplayImage = {};
 }
 
 void GpuPathTracer::CreateImages(uint32_t width, uint32_t height)
 {
-	if (m_AccumulationImage != VK_NULL_HANDLE)
+	if (m_AccumulationImage.Image != VK_NULL_HANDLE)
 		ReleaseImages();
 
 	CreateStorageImage(width, height, VK_FORMAT_R32G32B32A32_SFLOAT,
-		VK_IMAGE_USAGE_STORAGE_BIT, m_AccumulationImage, m_AccumulationImageMemory, m_AccumulationImageView);
+		VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+		m_AccumulationImage.Image, m_AccumulationImage.Memory, m_AccumulationImage.View);
 
 	CreateStorageImage(width, height, VK_FORMAT_R8G8B8A8_UNORM,
-		VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, m_DisplayImage, m_DisplayImageMemory, m_DisplayImageView);
+		VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+		m_DisplayImage.Image, m_DisplayImage.Memory, m_DisplayImage.View);
 
 	if (m_DisplaySampler == VK_NULL_HANDLE)
 	{
@@ -381,8 +432,8 @@ void GpuPathTracer::CreateImages(uint32_t width, uint32_t height)
 		b.subresourceRange.levelCount = 1;
 		b.subresourceRange.layerCount = 1;
 	}
-	barriers[0].image = m_AccumulationImage;
-	barriers[1].image = m_DisplayImage;
+	barriers[0].image = m_AccumulationImage.Image;
+	barriers[1].image = m_DisplayImage.Image;
 
 	vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		0, 0, nullptr, 0, nullptr, 2, barriers);
@@ -390,27 +441,10 @@ void GpuPathTracer::CreateImages(uint32_t width, uint32_t height)
 	Walnut::Application::FlushCommandBuffer(commandBuffer);
 
 	// Register the display image directly with ImGui - no CPU readback, no Walnut::Image involved.
-	m_DisplayDescriptorSet = (VkDescriptorSet)ImGui_ImplVulkan_AddTexture(m_DisplaySampler, m_DisplayImageView, VK_IMAGE_LAYOUT_GENERAL);
+	m_DisplayDescriptorSet = (VkDescriptorSet)ImGui_ImplVulkan_AddTexture(m_DisplaySampler, m_DisplayImage.View, VK_IMAGE_LAYOUT_GENERAL);
 
-	VkDescriptorImageInfo accumImageInfo{ VK_NULL_HANDLE, m_AccumulationImageView, VK_IMAGE_LAYOUT_GENERAL };
-	VkDescriptorImageInfo displayImageInfo{ VK_NULL_HANDLE, m_DisplayImageView, VK_IMAGE_LAYOUT_GENERAL };
-
-	VkWriteDescriptorSet writes[2]{};
-	writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-	writes[0].dstSet = m_DescriptorSet;
-	writes[0].dstBinding = 3;
-	writes[0].descriptorCount = 1;
-	writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-	writes[0].pImageInfo = &accumImageInfo;
-
-	writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-	writes[1].dstSet = m_DescriptorSet;
-	writes[1].dstBinding = 4;
-	writes[1].descriptorCount = 1;
-	writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-	writes[1].pImageInfo = &displayImageInfo;
-
-	vkUpdateDescriptorSets(Walnut::Application::GetDevice(), 2, writes, 0, nullptr);
+	WriteImageDescriptor(Binding::AccumulationImage, m_AccumulationImage.View);
+	WriteImageDescriptor(Binding::DisplayImage, m_DisplayImage.View);
 }
 
 void GpuPathTracer::ReadImage(VkImage image, VkDeviceSize bytesPerPixel, void* destination)
@@ -470,15 +504,15 @@ void GpuPathTracer::ReadImage(VkImage image, VkDeviceSize bytesPerPixel, void* d
 void GpuPathTracer::ReadDisplayImage(std::vector<uint32_t>& pixels)
 {
 	pixels.resize((size_t)m_Width * m_Height);
-	if (m_DisplayImage != VK_NULL_HANDLE)
-		ReadImage(m_DisplayImage, sizeof(uint32_t), pixels.data());
+	if (m_DisplayImage.Image != VK_NULL_HANDLE)
+		ReadImage(m_DisplayImage.Image, sizeof(uint32_t), pixels.data());
 }
 
 void GpuPathTracer::ReadAccumulationImage(std::vector<glm::vec4>& pixels)
 {
 	pixels.resize((size_t)m_Width * m_Height);
-	if (m_AccumulationImage != VK_NULL_HANDLE)
-		ReadImage(m_AccumulationImage, sizeof(glm::vec4), pixels.data());
+	if (m_AccumulationImage.Image != VK_NULL_HANDLE)
+		ReadImage(m_AccumulationImage.Image, sizeof(glm::vec4), pixels.data());
 }
 
 void GpuPathTracer::OnResize(uint32_t width, uint32_t height)
@@ -502,47 +536,39 @@ void GpuPathTracer::Render(const Scene& scene, const Camera& camera, const Rende
 	if (!m_Initialized || m_Width == 0 || m_Height == 0)
 		return;
 
-	CameraUBOData cameraData{};
-	cameraData.InverseProjection = camera.GetInverseProjection();
-	cameraData.InverseView = camera.GetInverseView();
-	cameraData.Position = glm::vec4(camera.GetPosition(), 1.0f);
-	cameraData.Lens = glm::vec4(camera.GetAperture(), camera.GetFocusDistance(), 0.0f, 0.0f);
-	cameraData.SkyBottomColor = glm::vec4(scene.Sky.BottomColor, scene.Sky.Intensity);
-	cameraData.SkyTopColor = glm::vec4(scene.Sky.TopColor, 0.0f);
-	cameraData.SkyMode = (int32_t)scene.Sky.Mode;
-	memcpy(m_CameraUBOMapped, &cameraData, sizeof(cameraData));
+	FrameUBOData frameData{};
+	frameData.InverseProjection = camera.GetInverseProjection();
+	frameData.InverseView = camera.GetInverseView();
+	frameData.Position = glm::vec4(camera.GetPosition(), 1.0f);
+	frameData.Lens = glm::vec4(camera.GetAperture(), camera.GetFocusDistance(), 0.0f, 0.0f);
+	frameData.SkyBottomColor = glm::vec4(scene.Sky.BottomColor, scene.Sky.Intensity);
+	frameData.SkyTopColor = glm::vec4(scene.Sky.TopColor, 0.0f);
+	frameData.SkyMode = (int32_t)scene.Sky.Mode;
+	Upload(m_FrameBuffer, Binding::Frame, BindingTypes[Binding::Frame], &frameData, sizeof(frameData));
 
-	uint32_t sphereCount = std::min((uint32_t)scene.Spheres.size(), MaxSpheres);
-	if (sphereCount > 0)
+	std::vector<SphereGPU> spheres(scene.Spheres.size());
+	for (size_t i = 0; i < spheres.size(); i++)
 	{
-		std::vector<SphereGPU> spheres(sphereCount);
-		for (uint32_t i = 0; i < sphereCount; i++)
-		{
-			spheres[i].PositionAndRadius = glm::vec4(scene.Spheres[i].Position, scene.Spheres[i].Radius);
-			spheres[i].MaterialIndex = glm::ivec4(scene.Spheres[i].MaterialIndex, 0, 0, 0);
-		}
-		memcpy(m_SphereSSBOMapped, spheres.data(), sphereCount * sizeof(SphereGPU));
+		spheres[i].PositionAndRadius = glm::vec4(scene.Spheres[i].Position, scene.Spheres[i].Radius);
+		spheres[i].MaterialIndex = glm::ivec4(scene.Spheres[i].MaterialIndex, 0, 0, 0);
 	}
+	Upload(m_SphereBuffer, Binding::Spheres, BindingTypes[Binding::Spheres], spheres.data(), spheres.size() * sizeof(SphereGPU));
 
-	uint32_t materialCount = std::min((uint32_t)scene.Materials.size(), MaxMaterials);
-	if (materialCount > 0)
+	std::vector<MaterialGPU> materials(scene.Materials.size());
+	for (size_t i = 0; i < materials.size(); i++)
 	{
-		std::vector<MaterialGPU> materials(materialCount);
-		for (uint32_t i = 0; i < materialCount; i++)
-		{
-			const Material& material = scene.Materials[i];
-			materials[i].AlbedoRoughness = glm::vec4(material.Albedo, material.Roughness);
-			materials[i].EmissionAndPower = glm::vec4(material.EmissionColor, material.EmissionPower);
-			materials[i].MetallicPad = glm::vec4(material.Metallic, 0.0f, 0.0f, 0.0f);
-		}
-		memcpy(m_MaterialSSBOMapped, materials.data(), materialCount * sizeof(MaterialGPU));
+		const Material& material = scene.Materials[i];
+		materials[i].AlbedoRoughness = glm::vec4(material.Albedo, material.Roughness);
+		materials[i].EmissionAndPower = glm::vec4(material.EmissionColor, material.EmissionPower);
+		materials[i].MetallicPad = glm::vec4(material.Metallic, 0.0f, 0.0f, 0.0f);
 	}
+	Upload(m_MaterialBuffer, Binding::Materials, BindingTypes[Binding::Materials], materials.data(), materials.size() * sizeof(MaterialGPU));
 
 	PushConstants pushConstants{};
 	pushConstants.Width = m_Width;
 	pushConstants.Height = m_Height;
 	pushConstants.FirstSampleIndex = frame.FirstSampleIndex;
-	pushConstants.SphereCount = sphereCount;
+	pushConstants.SphereCount = (uint32_t)spheres.size();
 	pushConstants.Bounces = (uint32_t)std::max(settings.MaxBounces, 1);
 	pushConstants.RussianRoulette = settings.RussianRoulette ? 1u : 0u;
 	pushConstants.RussianRouletteStartBounce = (uint32_t)std::max(settings.RussianRouletteStartBounce, 0);
@@ -572,7 +598,7 @@ void GpuPathTracer::Render(const Scene& scene, const Camera& camera, const Rende
 	barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.image = m_DisplayImage;
+	barrier.image = m_DisplayImage.Image;
 	barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 	barrier.subresourceRange.levelCount = 1;
 	barrier.subresourceRange.layerCount = 1;
