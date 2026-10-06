@@ -99,23 +99,14 @@ bool Renderer::Render(const Scene& scene, const Camera& camera) {
 		frame.SampleCount = std::min(frame.SampleCount, (uint32_t)m_Settings.MaxSamples - std::min(m_AccumulatedSamples, (uint32_t)m_Settings.MaxSamples));
 	// Once converged SampleCount is 0: only re-resolve the accumulated image (so exposure/tone mapping stay live)
 
-	if (m_Settings.UseGPU) {
+	// Compare modes run both paths on exactly the same samples
+	bool comparing = m_Settings.Compare != CompareMode::Off;
+	if (m_Settings.UseGPU || comparing)
 		m_GpuPathTracer.Render(scene, camera, m_Settings, frame);
-	}
-	else {
-		uint32_t width = m_FinalImage->GetWidth();
-		if (frame.ResetAccumulation)
-			memset(m_AccumulationData, 0, width * m_FinalImage->GetHeight() * sizeof(glm::vec4));
-
-		Utils::ForEachPixel(m_ImageHorizontalIter, m_ImageVerticalIter, [this, &frame, width](uint32_t x, uint32_t y) {
-			uint32_t index = x + y * width;
-			for (uint32_t s = 0; s < frame.SampleCount; s++)
-				m_AccumulationData[index] += PerPixel(x, y, frame.FirstSampleIndex + s);
-			m_ImageData[index] = Utils::ConvertToRGBA(ToneMapping::Resolve(m_AccumulationData[index], m_Settings));
-		});
-
-		m_FinalImage->SetData(m_ImageData);
-	}
+	if (!m_Settings.UseGPU || comparing)
+		RenderCPU(frame);
+	if (m_Settings.Compare == CompareMode::Difference)
+		UpdateDifferenceImage();
 
 	if (frame.SampleCount == 0)
 		return false;
@@ -270,6 +261,59 @@ Renderer::HitPayload Renderer::Miss(const Ray& ray) {
 	return payload;
 }
 
+void Renderer::RenderCPU(const FrameParams& frame) {
+	uint32_t width = m_FinalImage->GetWidth();
+	if (frame.ResetAccumulation)
+		memset(m_AccumulationData, 0, width * m_FinalImage->GetHeight() * sizeof(glm::vec4));
+
+	Utils::ForEachPixel(m_ImageHorizontalIter, m_ImageVerticalIter, [this, &frame, width](uint32_t x, uint32_t y) {
+		uint32_t index = x + y * width;
+		for (uint32_t s = 0; s < frame.SampleCount; s++)
+			m_AccumulationData[index] += PerPixel(x, y, frame.FirstSampleIndex + s);
+		m_ImageData[index] = Utils::ConvertToRGBA(ToneMapping::Resolve(m_AccumulationData[index], m_Settings));
+	});
+
+	m_FinalImage->SetData(m_ImageData);
+}
+
+void Renderer::UpdateDifferenceImage() {
+	uint32_t width = m_FinalImage->GetWidth();
+	uint32_t height = m_FinalImage->GetHeight();
+	if (m_GpuPathTracer.GetWidth() != width || m_GpuPathTracer.GetHeight() != height)
+		return;
+
+	if (!m_DifferenceImage)
+		m_DifferenceImage = std::make_shared<Walnut::Image>(width, height, Walnut::ImageFormat::RGBA);
+	else if (m_DifferenceImage->GetWidth() != width || m_DifferenceImage->GetHeight() != height)
+		m_DifferenceImage->Resize(width, height);
+
+	m_GpuPathTracer.ReadDisplayImage(m_GPUPixels);
+	m_DifferenceData.resize((size_t)width * height);
+
+	float scale = m_Settings.DifferenceScale;
+	Utils::ForEachPixel(m_ImageHorizontalIter, m_ImageVerticalIter, [&](uint32_t x, uint32_t y) {
+		uint32_t index = x + y * width;
+		uint32_t cpu = m_ImageData[index], gpu = m_GPUPixels[index];
+		uint32_t result = 0xff000000;
+		for (int shift = 0; shift < 24; shift += 8) {
+			int difference = std::abs((int)((cpu >> shift) & 0xff) - (int)((gpu >> shift) & 0xff));
+			result |= (uint32_t)std::min((int)(difference * scale + 0.5f), 255) << shift;
+		}
+		m_DifferenceData[index] = result;
+	});
+
+	// Mean error in a serial pass (cheap next to tracing, and avoids sharing a sum across threads)
+	uint64_t totalError = 0;
+	for (size_t i = 0; i < m_DifferenceData.size(); i++) {
+		uint32_t cpu = m_ImageData[i], gpu = m_GPUPixels[i];
+		for (int shift = 0; shift < 24; shift += 8)
+			totalError += (uint64_t)std::abs((int)((cpu >> shift) & 0xff) - (int)((gpu >> shift) & 0xff));
+	}
+	m_CompareMeanError = (float)((double)totalError / (3.0 * (double)m_DifferenceData.size()));
+
+	m_DifferenceImage->SetData(m_DifferenceData.data());
+}
+
 ObjectRef Renderer::Pick(const Scene& scene, const Camera& camera, const glm::vec2& ndc, float* outDistance) {
 	m_ActiveScene = &scene;
 
@@ -323,6 +367,8 @@ bool Renderer::SaveImage(const std::string& path) {
 }
 
 VkDescriptorSet Renderer::GetFinalImageDescriptorSet() const {
+	if (m_Settings.Compare == CompareMode::Difference && m_DifferenceImage)
+		return m_DifferenceImage->GetDescriptorSet();
 	if (m_Settings.UseGPU)
 		return m_GpuPathTracer.GetDescriptorSet();
 	return m_FinalImage ? m_FinalImage->GetDescriptorSet() : nullptr;

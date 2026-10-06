@@ -8,6 +8,13 @@ enum class ToneMapper : int {
 	ACES = 2,
 };
 
+// Debug view that runs both render paths on the same samples so their output can be compared
+enum class CompareMode : int {
+	Off = 0,
+	Split = 1,      // CPU image left of a movable divider, GPU image right of it
+	Difference = 2, // |CPU - GPU| per pixel (of the tone mapped images), amplified
+};
+
 // What a single Render() call should do, computed by Renderer from the settings and accumulation state
 struct FrameParams {
 	bool ResetAccumulation = true; // discard previously accumulated samples first
@@ -22,6 +29,10 @@ struct RenderSettings {
 	int SamplesPerFrame = 1;
 	bool SlowRandom = false; // CPU only: use Walnut::Random instead of the PCG hash
 	bool UseGPU = false;
+
+	CompareMode Compare = CompareMode::Off;
+	float CompareSplit = 0.5f;      // divider position for CompareMode::Split, 0..1 across the viewport
+	float DifferenceScale = 8.0f;   // amplification for CompareMode::Difference
 
 	bool AntiAliasing = true; // jitter each sample within its pixel (off = always the pixel center)
 

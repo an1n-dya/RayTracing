@@ -25,6 +25,7 @@ struct AppOptions {
 	std::string RenderOutputPath;
 	int RenderSamples = 256;
 	int UseGPU = -1; // -1 = keep the default, 0 = --cpu, 1 = --gpu
+	CompareMode Compare = CompareMode::Off; // --compare split|difference
 };
 
 static AppOptions ParseCommandLine(int argc, char** argv) {
@@ -40,6 +41,10 @@ static AppOptions ParseCommandLine(int argc, char** argv) {
 			options.UseGPU = 1;
 		else if (strcmp(arg, "--cpu") == 0)
 			options.UseGPU = 0;
+		else if (strcmp(arg, "--compare") == 0 && hasValue) {
+			const char* mode = argv[++i];
+			options.Compare = strcmp(mode, "split") == 0 ? CompareMode::Split : strcmp(mode, "difference") == 0 ? CompareMode::Difference : CompareMode::Off;
+		}
 		else
 			fprintf(stderr, "Unknown or incomplete argument: %s\n", arg);
 	}
@@ -61,6 +66,7 @@ public:
 	{
 		if (m_Options.UseGPU >= 0)
 			m_Renderer.GetSettings().UseGPU = m_Options.UseGPU == 1;
+		m_Renderer.GetSettings().Compare = m_Options.Compare;
 		if (!m_Options.RenderOutputPath.empty())
 			m_Renderer.GetSettings().MaxSamples = m_Options.RenderSamples;
 
@@ -180,6 +186,23 @@ private:
 		ImGui::BeginDisabled(m_Renderer.GetSettings().UseGPU);
 		ImGui::Checkbox("Slow Random", &m_Renderer.GetSettings().SlowRandom);
 		ImGui::EndDisabled();
+
+		{
+			Renderer::Settings& settings = m_Renderer.GetSettings();
+			const char* compareModes[] = { "Off", "Split view", "Difference" };
+			int compareMode = (int)settings.Compare;
+			// Both paths need to start from the same (empty) accumulation to be comparable
+			if (ImGui::Combo("Compare CPU/GPU", &compareMode, compareModes, IM_ARRAYSIZE(compareModes))) {
+				settings.Compare = (CompareMode)compareMode;
+				m_Renderer.ResetFrameIndex();
+			}
+			if (settings.Compare == CompareMode::Split)
+				ImGui::TextDisabled("Drag the divider in the viewport (CPU left, GPU right)");
+			if (settings.Compare == CompareMode::Difference) {
+				ImGui::SliderFloat("Difference Scale", &settings.DifferenceScale, 1.0f, 64.0f, "x%.0f", ImGuiSliderFlags_Logarithmic);
+				ImGui::Text("Mean |CPU - GPU|: %.3f / 255", m_Renderer.GetCompareMeanError());
+			}
+		}
 
 		if (ImGui::Button("Reset"))
 			m_Renderer.ResetFrameIndex();
@@ -403,15 +426,47 @@ private:
 		m_ViewportWidth = (uint32_t)ImGui::GetContentRegionAvail().x;
 		m_ViewportHeight = (uint32_t)ImGui::GetContentRegionAvail().y;
 
-		VkDescriptorSet imageDescriptor = m_Renderer.GetFinalImageDescriptorSet();
+		Renderer::Settings& settings = m_Renderer.GetSettings();
+		bool splitView = settings.Compare == CompareMode::Split && m_Renderer.GetGPUImageDescriptorSet();
+
+		VkDescriptorSet imageDescriptor = splitView ? m_Renderer.GetCPUImageDescriptorSet() : m_Renderer.GetFinalImageDescriptorSet();
 		if (imageDescriptor) {
 			ImVec2 imageSize = { (float)m_Renderer.GetFinalImageWidth(), (float)m_Renderer.GetFinalImageHeight() };
 			ImGui::Image(imageDescriptor, imageSize, ImVec2(0, 1), ImVec2(1, 0));
 			ImVec2 imageMin = ImGui::GetItemRectMin();
+			ImVec2 imageMax = ImGui::GetItemRectMax();
+			bool hovered = ImGui::IsItemHovered();
+			bool clicked = hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsMouseDown(ImGuiMouseButton_Right);
+
+			if (splitView) {
+				// GPU image to the right of the divider, drawn over the CPU image
+				float dividerX = imageMin.x + settings.CompareSplit * imageSize.x;
+				ImDrawList* drawList = ImGui::GetWindowDrawList();
+				drawList->AddImage(m_Renderer.GetGPUImageDescriptorSet(), ImVec2(dividerX, imageMin.y), imageMax,
+					ImVec2(settings.CompareSplit, 1.0f), ImVec2(1.0f, 0.0f));
+				drawList->AddLine(ImVec2(dividerX, imageMin.y), ImVec2(dividerX, imageMax.y), IM_COL32(255, 255, 255, 200), 2.0f);
+				drawList->AddText(ImVec2(imageMin.x + 8.0f, imageMin.y + 8.0f), IM_COL32(255, 255, 255, 220), "CPU");
+				drawList->AddText(ImVec2(dividerX + 8.0f, imageMin.y + 8.0f), IM_COL32(255, 255, 255, 220), "GPU");
+
+				// Dragging near the divider moves it instead of picking
+				bool nearDivider = hovered && std::abs(ImGui::GetMousePos().x - dividerX) < 6.0f;
+				if (nearDivider || m_DraggingDivider)
+					ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+				if (nearDivider && clicked) {
+					m_DraggingDivider = true;
+					clicked = false;
+				}
+				if (m_DraggingDivider) {
+					if (ImGui::IsMouseDown(ImGuiMouseButton_Left))
+						settings.CompareSplit = glm::clamp((ImGui::GetMousePos().x - imageMin.x) / imageSize.x, 0.0f, 1.0f);
+					else
+						m_DraggingDivider = false;
+				}
+			}
 
 			// Left click selects, Ctrl+left click focuses the camera on the point under the cursor.
 			// (Right mouse is camera look, so ignore clicks while it's held.)
-			if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
+			if (clicked) {
 				ImVec2 mouse = ImGui::GetMousePos();
 				// The image is drawn flipped (row 0 = bottom), so NDC y points up
 				glm::vec2 ndc = { (mouse.x - imageMin.x) / imageSize.x * 2.0f - 1.0f, 1.0f - (mouse.y - imageMin.y) / imageSize.y * 2.0f };
@@ -487,6 +542,7 @@ private:
 	uint32_t m_ViewportWidth = 0, m_ViewportHeight = 0;
 
 	ObjectRef m_Selection;
+	bool m_DraggingDivider = false; // CompareMode::Split
 	bool m_SceneChanged = false; // set by any edit during the current frame
 
 	float m_LastRenderTime = 0.0f;
