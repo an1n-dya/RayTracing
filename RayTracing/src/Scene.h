@@ -13,6 +13,8 @@ struct Material {
 	float Metallic = 0.0f;
 	glm::vec3 EmissionColor{ 0.0f };
 	float EmissionPower = 0.0f;
+	float Transmission = 0.0f; // 0 = opaque, 1 = glass (only for the non-metallic part)
+	float IOR = 1.5f;          // index of refraction; also sets the dielectric specular F0
 
 	glm::vec3 GetEmission() const { return EmissionColor * EmissionPower; }
 };

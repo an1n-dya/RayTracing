@@ -163,9 +163,10 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex) {
 		// Emission is weighted by the throughput accumulated *before* this surface scatters the path
 		light += material.GetEmission() * contribution;
 
-		// Shade with the normal facing the incoming ray (a ray can hit a surface from behind)
+		// Shade with the normal facing the incoming ray (a ray can hit a surface from behind, e.g. from inside glass)
 		glm::vec3 wo = -ray.Direction;
-		glm::vec3 normal = glm::dot(payload.WorldNormal, wo) < 0.0f ? -payload.WorldNormal : payload.WorldNormal;
+		bool frontFace = glm::dot(payload.WorldNormal, wo) >= 0.0f;
+		glm::vec3 normal = frontFace ? payload.WorldNormal : -payload.WorldNormal;
 
 		// Draw the random numbers one at a time so the order matches the GPU path
 		glm::vec3 u;
@@ -174,11 +175,12 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex) {
 		u.z = RandomFloat(seed);
 
 		BSDF::Sample bsdfSample;
-		if (!BSDF::SampleDirection(material, normal, wo, u, bsdfSample))
+		if (!BSDF::SampleDirection(material, normal, wo, frontFace, u, bsdfSample))
 			break;
 		contribution *= bsdfSample.Weight;
 
-		ray.Origin = payload.WorldPosition + normal * 0.0001f;
+		// Nudge the origin off the surface, to whichever side the new ray leaves on (transmission goes through)
+		ray.Origin = payload.WorldPosition + normal * (glm::dot(bsdfSample.Direction, normal) > 0.0f ? 0.0001f : -0.0001f);
 		ray.Direction = bsdfSample.Direction;
 
 		// Russian roulette: randomly end paths that can't carry much more light, boosting the
@@ -229,8 +231,11 @@ Renderer::HitPayload Renderer::TraceRay(const Ray& ray) {
 		// Solve for t using the quadratic formula:
 		// t = (-b +- sqrt(discriminant)) / 2a
 		
-		// float t0 = (-b + glm::sqrt(discriminant)) / (2.0f * a); // Second hit distance (currently unused)
-		float closestT = (-b - glm::sqrt(discriminant)) / (2.0f * a);
+		// Take the near hit, or the far one if the ray starts inside the sphere (e.g. after refracting into glass)
+		float sqrtDiscriminant = glm::sqrt(discriminant);
+		float closestT = (-b - sqrtDiscriminant) / (2.0f * a);
+		if (closestT <= 0.0f)
+			closestT = (-b + sqrtDiscriminant) / (2.0f * a);
 		if (closestT > 0.0f && closestT < hitDistance) {
 			hitDistance = closestT;
 			closestSphere = (int)i;

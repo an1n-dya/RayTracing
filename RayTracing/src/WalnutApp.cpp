@@ -353,6 +353,8 @@ private:
 				m_SceneChanged |= ImGui::ColorEdit3("Albedo", glm::value_ptr(material.Albedo));
 				m_SceneChanged |= ImGui::DragFloat("Roughness", &material.Roughness, 0.01f, 0.0f, 1.0f);
 				m_SceneChanged |= ImGui::DragFloat("Metallic", &material.Metallic, 0.01f, 0.0f, 1.0f);
+				m_SceneChanged |= ImGui::DragFloat("Transmission", &material.Transmission, 0.01f, 0.0f, 1.0f);
+				m_SceneChanged |= ImGui::DragFloat("IOR", &material.IOR, 0.005f, 1.0f, 3.0f);
 				m_SceneChanged |= ImGui::ColorEdit3("Emission Color", glm::value_ptr(material.EmissionColor));
 				m_SceneChanged |= ImGui::DragFloat("Emission Power", &material.EmissionPower, 0.05f, 0.0f, FLT_MAX);
 

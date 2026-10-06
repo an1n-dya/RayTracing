@@ -1,6 +1,7 @@
 // Material scattering model. C++ counterpart: BSDF.h - keep the two in sync (see the conventions there).
 //
-// Lobes: GGX specular (F0 = mix(0.04, albedo, metallic)) + Lambert diffuse scaled by (1 - metallic)(1 - F).
+// Parts: glass (weight (1 - metallic) * transmission, sample-only "delta" lobe), GGX specular
+// (F0 = mix(F0 from IOR, albedo, metallic)) and Lambert diffuse scaled by (1 - metallic)(1 - F).
 
 #ifndef BSDF_GLSL
 #define BSDF_GLSL
@@ -12,12 +13,15 @@ struct SurfaceMaterial {
 	vec3 Albedo;
 	float Roughness;
 	float Metallic;
+	float Transmission;
+	float IOR;
 };
 
 struct BSDFSample {
 	vec3 Direction; // wi
 	vec3 Weight;    // f * |cos(wi)| / pdf
-	float Pdf;
+	float Pdf;      // 0 for delta lobes
+	bool Delta;     // sampled from the glass part, which EvaluateBSDF()/PdfBSDF() don't cover
 };
 
 float Luminance(vec3 color) { return dot(color, vec3(0.2126, 0.7152, 0.0722)); }
@@ -29,6 +33,18 @@ vec3 FresnelSchlick(vec3 f0, float cosTheta)
 	float m = clamp(1.0 - cosTheta, 0.0, 1.0);
 	float m5 = m * m * m * m * m;
 	return f0 + (1.0 - f0) * m5;
+}
+
+float FresnelDielectric(float cosI, float eta)
+{
+	cosI = clamp(cosI, 0.0, 1.0);
+	float sin2T = eta * eta * (1.0 - cosI * cosI);
+	if (sin2T >= 1.0)
+		return 1.0; // total internal reflection
+	float cosT = sqrt(1.0 - sin2T);
+	float rs = (eta * cosI - cosT) / (eta * cosI + cosT);
+	float rp = (cosI - eta * cosT) / (cosI + eta * cosT);
+	return 0.5 * (rs * rs + rp * rp);
 }
 
 float DistributionGGX(float NoH, float alpha)
@@ -78,9 +94,15 @@ vec3 SampleGGXVNDF(vec3 v, float alpha, float u1, float u2)
 	return normalize(vec3(alpha * nh.x, alpha * nh.y, max(0.0, nh.z)));
 }
 
+float GlassWeight(SurfaceMaterial material)
+{
+	return (1.0 - material.Metallic) * material.Transmission;
+}
+
 vec3 SpecularF0(SurfaceMaterial material)
 {
-	return mix(vec3(0.04), material.Albedo, material.Metallic);
+	float f0 = (material.IOR - 1.0) / (material.IOR + 1.0);
+	return mix(vec3(f0 * f0), material.Albedo, material.Metallic);
 }
 
 float SpecularProbability(SurfaceMaterial material, float NoV)
@@ -92,7 +114,7 @@ float SpecularProbability(SurfaceMaterial material, float NoV)
 	return clamp(specular / (specular + diffuse), 0.05, 0.95);
 }
 
-// f(wo, wi) * cos(wi)
+// f(wo, wi) * cos(wi), excluding the glass part
 vec3 EvaluateBSDF(SurfaceMaterial material, vec3 n, vec3 wo, vec3 wi)
 {
 	float NoV = dot(n, wo);
@@ -111,7 +133,7 @@ vec3 EvaluateBSDF(SurfaceMaterial material, vec3 n, vec3 wo, vec3 wi)
 
 	vec3 specular = F * (D * G / (4.0 * NoV * NoL));
 	vec3 diffuse = (1.0 - F) * (1.0 - material.Metallic) * material.Albedo / BSDF_PI;
-	return (specular + diffuse) * NoL;
+	return (1.0 - GlassWeight(material)) * (specular + diffuse) * NoL;
 }
 
 float PdfBSDF(SurfaceMaterial material, vec3 n, vec3 wo, vec3 wi)
@@ -129,14 +151,15 @@ float PdfBSDF(SurfaceMaterial material, vec3 n, vec3 wo, vec3 wi)
 	float diffusePdf = NoL / BSDF_PI;
 
 	float pSpecular = SpecularProbability(material, NoV);
-	return pSpecular * specularPdf + (1.0 - pSpecular) * diffusePdf;
+	return (1.0 - GlassWeight(material)) * (pSpecular * specularPdf + (1.0 - pSpecular) * diffusePdf);
 }
 
-bool SampleBSDF(SurfaceMaterial material, vec3 n, vec3 wo, vec3 u, out BSDFSample bsdfSample)
+bool SampleBSDF(SurfaceMaterial material, vec3 n, vec3 wo, bool frontFace, vec3 u, out BSDFSample bsdfSample)
 {
 	bsdfSample.Direction = vec3(0.0);
 	bsdfSample.Weight = vec3(0.0);
 	bsdfSample.Pdf = 0.0;
+	bsdfSample.Delta = false;
 
 	float NoV = dot(n, wo);
 	if (NoV <= 0.0)
@@ -144,12 +167,49 @@ bool SampleBSDF(SurfaceMaterial material, vec3 n, vec3 wo, vec3 u, out BSDFSampl
 
 	vec3 t, b;
 	BuildBasis(n, t, b);
+	vec3 woLocal = vec3(dot(wo, t), dot(wo, b), NoV);
+	float alpha = RoughnessToAlpha(material.Roughness);
 
-	vec3 wi;
-	if (u.x < SpecularProbability(material, NoV))
+	float pGlass = GlassWeight(material);
+	if (u.x < pGlass)
 	{
-		vec3 woLocal = vec3(dot(wo, t), dot(wo, b), NoV);
-		vec3 hLocal = SampleGGXVNDF(woLocal, RoughnessToAlpha(material.Roughness), u.y, u.z);
+		float choice = u.x / pGlass;
+
+		vec3 mLocal = SampleGGXVNDF(woLocal, alpha, u.y, u.z);
+		vec3 m = mLocal.x * t + mLocal.y * b + mLocal.z * n;
+
+		float eta = frontFace ? 1.0 / material.IOR : material.IOR;
+		float F = FresnelDielectric(dot(wo, m), eta);
+
+		vec3 wi;
+		vec3 weight = vec3(1.0);
+		if (choice < F)
+		{
+			wi = reflect(-wo, m);
+			if (dot(n, wi) <= 0.0)
+				return false;
+		}
+		else
+		{
+			wi = refract(-wo, m, eta);
+			if (dot(n, wi) >= 0.0)
+				return false;
+			if (frontFace)
+				weight = material.Albedo;
+		}
+
+		bsdfSample.Direction = wi;
+		bsdfSample.Weight = weight * SmithG1(abs(dot(n, wi)), alpha);
+		bsdfSample.Pdf = 0.0;
+		bsdfSample.Delta = true;
+		return true;
+	}
+
+	float choice = (u.x - pGlass) / (1.0 - pGlass);
+	vec3 wi;
+	if (choice < SpecularProbability(material, NoV))
+	{
+		vec3 hLocal = SampleGGXVNDF(woLocal, alpha, u.y, u.z);
 		vec3 h = hLocal.x * t + hLocal.y * b + hLocal.z * n;
 		wi = reflect(-wo, h);
 	}

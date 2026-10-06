@@ -43,7 +43,7 @@ namespace {
 	struct MaterialGPU {
 		glm::vec4 AlbedoRoughness;  // rgb = albedo, w = roughness
 		glm::vec4 EmissionAndPower; // rgb = emission color, w = emission power
-		glm::vec4 MetallicPad;      // x = metallic
+		glm::vec4 MetallicTransmissionIOR; // x = metallic, y = transmission, z = IOR
 	};
 
 	struct FrameUBOData {
@@ -560,7 +560,7 @@ void GpuPathTracer::Render(const Scene& scene, const Camera& camera, const Rende
 		const Material& material = scene.Materials[i];
 		materials[i].AlbedoRoughness = glm::vec4(material.Albedo, material.Roughness);
 		materials[i].EmissionAndPower = glm::vec4(material.EmissionColor, material.EmissionPower);
-		materials[i].MetallicPad = glm::vec4(material.Metallic, 0.0f, 0.0f, 0.0f);
+		materials[i].MetallicTransmissionIOR = glm::vec4(material.Metallic, material.Transmission, material.IOR, 0.0f);
 	}
 	Upload(m_MaterialBuffer, Binding::Materials, BindingTypes[Binding::Materials], materials.data(), materials.size() * sizeof(MaterialGPU));
 

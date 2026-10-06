@@ -34,7 +34,7 @@ layout(std430, binding = 1) readonly buffer SphereBuffer {
 struct Material {
 	vec4 AlbedoRoughness;  // rgb = albedo, w = roughness
 	vec4 EmissionAndPower; // rgb = emission color, w = emission power
-	vec4 MetallicPad;      // x = metallic
+	vec4 MetallicTransmissionIOR; // x = metallic, y = transmission, z = IOR
 };
 
 layout(std430, binding = 2) readonly buffer MaterialBuffer {
@@ -172,7 +172,11 @@ HitPayload TraceRay(vec3 rayOrigin, vec3 rayDirection)
 		if (discriminant < 0.0)
 			continue;
 
-		float closestT = (-b - sqrt(discriminant)) / (2.0 * a);
+		// Near hit, or the far one if the ray starts inside the sphere
+		float sqrtDiscriminant = sqrt(discriminant);
+		float closestT = (-b - sqrtDiscriminant) / (2.0 * a);
+		if (closestT <= 0.0)
+			closestT = (-b + sqrtDiscriminant) / (2.0 * a);
 		if (closestT > 0.0 && closestT < hitDistance)
 		{
 			hitDistance = closestT;
@@ -240,16 +244,19 @@ vec3 PerPixel(uvec2 pixelCoord, uint sampleIndex)
 		SurfaceMaterial material;
 		material.Albedo = Materials[materialIndex].AlbedoRoughness.rgb;
 		material.Roughness = Materials[materialIndex].AlbedoRoughness.w;
-		material.Metallic = Materials[materialIndex].MetallicPad.x;
+		material.Metallic = Materials[materialIndex].MetallicTransmissionIOR.x;
+		material.Transmission = Materials[materialIndex].MetallicTransmissionIOR.y;
+		material.IOR = Materials[materialIndex].MetallicTransmissionIOR.z;
 		vec3 emissionColor = Materials[materialIndex].EmissionAndPower.rgb;
 		float emissionPower = Materials[materialIndex].EmissionAndPower.w;
 
 		// Emission is weighted by the throughput accumulated *before* this surface scatters the path
 		light += emissionColor * emissionPower * contribution;
 
-		// Shade with the normal facing the incoming ray (a ray can hit a surface from behind)
+		// Shade with the normal facing the incoming ray (a ray can hit a surface from behind, e.g. from inside glass)
 		vec3 wo = -rayDirection;
-		vec3 normal = dot(payload.WorldNormal, wo) < 0.0 ? -payload.WorldNormal : payload.WorldNormal;
+		bool frontFace = dot(payload.WorldNormal, wo) >= 0.0;
+		vec3 normal = frontFace ? payload.WorldNormal : -payload.WorldNormal;
 
 		vec3 u;
 		u.x = RandomFloat(seed);
@@ -257,11 +264,12 @@ vec3 PerPixel(uvec2 pixelCoord, uint sampleIndex)
 		u.z = RandomFloat(seed);
 
 		BSDFSample bsdfSample;
-		if (!SampleBSDF(material, normal, wo, u, bsdfSample))
+		if (!SampleBSDF(material, normal, wo, frontFace, u, bsdfSample))
 			break;
 		contribution *= bsdfSample.Weight;
 
-		rayOrigin = payload.WorldPosition + normal * 0.0001;
+		// Nudge the origin off the surface, to whichever side the new ray leaves on
+		rayOrigin = payload.WorldPosition + normal * (dot(bsdfSample.Direction, normal) > 0.0 ? 0.0001 : -0.0001);
 		rayDirection = bsdfSample.Direction;
 
 		// Russian roulette (same as Renderer::PerPixel)
