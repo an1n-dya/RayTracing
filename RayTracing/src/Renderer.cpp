@@ -139,8 +139,9 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y) {
 		const Sphere& sphere = m_ActiveScene->Spheres[payload.ObjectIndex];
 		const Material& material = m_ActiveScene->Materials[sphere.MaterialIndex];
 
+		// Emission is weighted by the throughput accumulated *before* this surface's albedo is applied
+		light += material.GetEmission() * contribution;
 		contribution *= material.Albedo;
-		light += material.GetEmission();
 
 		ray.Origin = payload.WorldPosition + payload.WorldNormal * 0.0001f;
 		//ray.Direction = glm::reflect(ray.Direction,

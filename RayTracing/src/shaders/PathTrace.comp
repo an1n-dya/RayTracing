@@ -162,8 +162,9 @@ vec3 PerPixel(uvec2 pixelCoord)
 		vec3 emissionColor = Materials[materialIndex].EmissionAndPower.rgb;
 		float emissionPower = Materials[materialIndex].EmissionAndPower.w;
 
+		// Emission is weighted by the throughput accumulated *before* this surface's albedo is applied
+		light += emissionColor * emissionPower * contribution;
 		contribution *= albedo;
-		light += emissionColor * emissionPower;
 
 		rayOrigin = payload.WorldPosition + payload.WorldNormal * 0.0001;
 		rayDirection = normalize(payload.WorldNormal + RandomInUnitSphere(seed));
