@@ -148,9 +148,11 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex) {
 	glm::vec2 ndc = (glm::vec2((float)x, (float)y) + jitter) / glm::vec2((float)m_FinalImage->GetWidth(), (float)m_FinalImage->GetHeight());
 	ndc = ndc * 2.0f - 1.0f; // -1 -> 1
 
-	Ray ray;
-	ray.Origin = m_ActiveCamera->GetPosition();
-	ray.Direction = m_ActiveCamera->GetRayDirection(ndc);
+	glm::vec2 lensSample(0.0f);
+	if (m_ActiveCamera->GetAperture() > 0.0f)
+		lensSample = { RandomFloat(seed), RandomFloat(seed) };
+
+	Ray ray = m_ActiveCamera->GenerateRay(ndc, lensSample);
 
 	glm::vec3 light(0.0f);
 	glm::vec3 contribution(1.0f);

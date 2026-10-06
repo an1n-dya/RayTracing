@@ -30,6 +30,7 @@ namespace {
 		glm::mat4 InverseProjection;
 		glm::mat4 InverseView;
 		glm::vec4 Position;
+		glm::vec4 Lens; // x = aperture, y = focus distance
 
 		glm::vec4 SkyBottomColor; // rgb = color, w = intensity
 		glm::vec4 SkyTopColor;
@@ -505,6 +506,7 @@ void GpuPathTracer::Render(const Scene& scene, const Camera& camera, const Rende
 	cameraData.InverseProjection = camera.GetInverseProjection();
 	cameraData.InverseView = camera.GetInverseView();
 	cameraData.Position = glm::vec4(camera.GetPosition(), 1.0f);
+	cameraData.Lens = glm::vec4(camera.GetAperture(), camera.GetFocusDistance(), 0.0f, 0.0f);
 	cameraData.SkyBottomColor = glm::vec4(scene.Sky.BottomColor, scene.Sky.Intensity);
 	cameraData.SkyTopColor = glm::vec4(scene.Sky.TopColor, 0.0f);
 	cameraData.SkyMode = (int32_t)scene.Sky.Mode;

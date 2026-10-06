@@ -5,10 +5,13 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
+const float PI = 3.14159265358979323846;
+
 layout(std140, binding = 0) uniform FrameData {
 	mat4 InverseProjection;
 	mat4 InverseView;
 	vec4 Position; // xyz used
+	vec4 Lens;     // x = aperture (lens diameter, 0 = pinhole), y = focus distance
 
 	// Scene::Sky
 	vec4 SkyBottomColor; // rgb = color, w = intensity
@@ -202,9 +205,28 @@ vec3 PerPixel(uvec2 pixelCoord, uint sampleIndex)
 	vec2 coord = (vec2(pixelCoord) + jitter) / vec2(u_PC.Width, u_PC.Height);
 	coord = coord * 2.0 - 1.0; // -1 -> 1
 
+	// Thin-lens camera, same as Camera::GenerateRay. View space: camera at the origin looking down -Z.
 	vec4 target = u_Camera.InverseProjection * vec4(coord.x, coord.y, 1.0, 1.0);
-	vec3 rayDirection = vec3(u_Camera.InverseView * vec4(normalize(vec3(target) / target.w), 0.0));
-	vec3 rayOrigin = u_Camera.Position.xyz;
+	vec3 viewDirection = normalize(vec3(target) / target.w);
+	vec3 viewOrigin = vec3(0.0);
+
+	float aperture = u_Camera.Lens.x;
+	if (aperture > 0.0)
+	{
+		vec2 lensSample;
+		lensSample.x = RandomFloat(seed);
+		lensSample.y = RandomFloat(seed);
+
+		vec3 focusPoint = viewDirection * (u_Camera.Lens.y / -viewDirection.z);
+
+		float radius = 0.5 * aperture * sqrt(lensSample.x);
+		float theta = 2.0 * PI * lensSample.y;
+		viewOrigin = vec3(radius * cos(theta), radius * sin(theta), 0.0);
+		viewDirection = normalize(focusPoint - viewOrigin);
+	}
+
+	vec3 rayOrigin = vec3(u_Camera.InverseView * vec4(viewOrigin, 1.0));
+	vec3 rayDirection = vec3(u_Camera.InverseView * vec4(viewDirection, 0.0));
 
 	vec3 light = vec3(0.0);
 	vec3 contribution = vec3(1.0);

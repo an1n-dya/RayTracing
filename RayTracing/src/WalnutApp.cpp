@@ -160,6 +160,17 @@ public:
 			float moveSpeed = m_Camera.GetMoveSpeed();
 			if (ImGui::DragFloat("Move Speed", &moveSpeed, 0.1f, 0.1f, 100.0f, "%.1f units/s"))
 				m_Camera.SetMoveSpeed(moveSpeed);
+
+			float aperture = m_Camera.GetAperture();
+			if (ImGui::DragFloat("Aperture", &aperture, 0.005f, 0.0f, 10.0f, aperture > 0.0f ? "%.3f" : "pinhole")) {
+				m_Camera.SetAperture(std::max(aperture, 0.0f));
+				m_Renderer.ResetFrameIndex();
+			}
+			float focusDistance = m_Camera.GetFocusDistance();
+			if (ImGui::DragFloat("Focus Distance", &focusDistance, 0.05f, 0.01f, 1000.0f)) {
+				m_Camera.SetFocusDistance(std::max(focusDistance, 0.01f));
+				m_Renderer.ResetFrameIndex();
+			}
 		}
 
 		ImGui::End();
