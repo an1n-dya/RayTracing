@@ -3,6 +3,7 @@
 #include "Walnut/Image.h"
 
 #include "Camera.h"
+#include "Denoiser.h"
 #include "GpuPathTracer.h"
 #include "PreparedScene.h"
 #include "Ray.h"
@@ -58,7 +59,15 @@ private:
 		int MaterialIndex;
 	};
 
-	glm::vec4 PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex); // RayGen
+	// One path's result: radiance, plus the first (non-mirror-like) surface's features for the denoiser
+	struct PathSample {
+		glm::vec3 Radiance{ 0.0f };
+		glm::vec3 Albedo{ 1.0f };
+		glm::vec3 Normal{ 0.0f }; // zero where the path escaped (sky)
+		float Depth = 0.0f;       // distance to the first hit along the camera ray
+	};
+
+	PathSample PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex); // RayGen
 
 	// Dispatch to the fast PCG hash or Walnut::Random depending on Settings.SlowRandom
 	float RandomFloat(uint32_t& seed) const;
@@ -90,6 +99,14 @@ private:
 
 	uint32_t* m_ImageData = nullptr;
 	glm::vec4* m_AccumulationData = nullptr;
+	// Denoiser features, accumulated alongside the color (sums, like m_AccumulationData)
+	std::vector<glm::vec4> m_AlbedoDepthData;  // rgb = albedo, a = depth
+	std::vector<glm::vec4> m_NormalMomentData; // xyz = normal, w = radiance luminance^2
+
+	std::unique_ptr<Denoiser> m_Denoiser = std::make_unique<ATrousDenoiser>();
+	std::vector<glm::vec3> m_DenoisedData; // linear
+	bool m_DenoisedValid = false;          // m_DenoisedData matches the current accumulation and settings
+	RenderSettings m_DenoisedSettings;
 
 	// CompareMode::Difference
 	std::shared_ptr<Walnut::Image> m_DifferenceImage;

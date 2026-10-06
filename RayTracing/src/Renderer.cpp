@@ -71,6 +71,10 @@ void Renderer::OnResize(uint32_t width, uint32_t height) {
 
 	delete[] m_AccumulationData;
 	m_AccumulationData = new glm::vec4[width * height];
+	m_AlbedoDepthData.resize((size_t)width * height);
+	m_NormalMomentData.resize((size_t)width * height);
+	m_DenoisedData.resize((size_t)width * height);
+	m_DenoisedValid = false;
 		
 	m_ImageHorizontalIter.resize(width);
 	m_ImageVerticalIter.resize(height);
@@ -125,7 +129,7 @@ bool Renderer::Render(const Scene& scene, const Camera& camera) {
 	return true;
 }
 
-glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex) {
+Renderer::PathSample Renderer::PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex) {
 	// Decorrelate pixels and samples: every (pixel, sample) pair gets its own random stream
 	uint32_t seed = Utils::PCG_Hash((x + y * m_FinalImage->GetWidth()) ^ Utils::PCG_Hash(sampleIndex));
 
@@ -149,9 +153,18 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex) {
 	float previousPdf = 0.0f;   // pdf of the BSDF sample that led to the current hit
 	bool previousDelta = true;  // ...or it came from a delta lobe / the camera, which light sampling can't produce
 
+	// Denoiser features come from the first surface that isn't glass or a polished metal (looking through/into those
+	// for up to two bounces), so reflections and refractions keep their detail
+	PathSample result;
+	bool featuresRecorded = false;
+
 	for (int i = 0; i < m_Settings.MaxBounces; i++) {
 		Renderer::HitPayload payload = TraceRay(ray);
 		if (payload.HitDistance < 0.0f) {
+			if (i == 0)
+				result.Depth = 1e4f;
+			featuresRecorded = true; // the sky: albedo 1, no normal
+
 			// An environment map is also a light that light sampling aims at: share it via MIS
 			float weight = 1.0f;
 			if (lightSampling && !previousDelta && m_Prepared.EnvironmentProbability > 0.0f) {
@@ -163,6 +176,8 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex) {
 		}
 
 		const Material& material = m_ActiveScene->Materials[payload.MaterialIndex];
+		if (i == 0)
+			result.Depth = payload.HitDistance;
 
 		// Only the front face of a surface emits (the side its normal points to)
 		glm::vec3 wo = -ray.Direction;
@@ -187,6 +202,15 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex) {
 		// Interpolated normals can face away from the viewer near silhouettes: use the true one there
 		if (glm::dot(normal, wo) <= 0.0f)
 			normal = geometricNormal;
+
+		if (!featuresRecorded) {
+			bool mirrorLike = BSDF::GlassWeight(material) > 0.5f || (material.Metallic > 0.5f && material.Roughness < 0.2f);
+			if (!mirrorLike || i >= 2) {
+				result.Albedo = material.Albedo;
+				result.Normal = normal;
+				featuresRecorded = true;
+			}
+		}
 
 		// Not at the last bounce: the BSDF-sampled ray it competes with (via MIS) would never be traced.
 		// Pure glass has nothing light sampling could contribute to (its lobe is delta-like).
@@ -225,7 +249,8 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex) {
 		}
 	}
 
-	return glm::vec4(light, 1.0f);
+	result.Radiance = light;
+	return result;
 }
 
 float Renderer::RandomFloat(uint32_t& seed) const {
@@ -479,15 +504,53 @@ Renderer::HitPayload Renderer::Miss(const Ray& ray) {
 
 void Renderer::RenderCPU(const FrameParams& frame) {
 	uint32_t width = m_FinalImage->GetWidth();
-	if (frame.ResetAccumulation)
-		memset(m_AccumulationData, 0, width * m_FinalImage->GetHeight() * sizeof(glm::vec4));
+	size_t pixelCount = (size_t)width * m_FinalImage->GetHeight();
+	if (frame.ResetAccumulation) {
+		memset(m_AccumulationData, 0, pixelCount * sizeof(glm::vec4));
+		std::fill(m_AlbedoDepthData.begin(), m_AlbedoDepthData.end(), glm::vec4(0.0f));
+		std::fill(m_NormalMomentData.begin(), m_NormalMomentData.end(), glm::vec4(0.0f));
+	}
 
-	Utils::ForEachPixel(m_ImageHorizontalIter, m_ImageVerticalIter, [this, &frame, width](uint32_t x, uint32_t y) {
+	bool denoise = m_Settings.Denoise;
+	Utils::ForEachPixel(m_ImageHorizontalIter, m_ImageVerticalIter, [this, &frame, width, denoise](uint32_t x, uint32_t y) {
 		uint32_t index = x + y * width;
-		for (uint32_t s = 0; s < frame.SampleCount; s++)
-			m_AccumulationData[index] += PerPixel(x, y, frame.FirstSampleIndex + s);
-		m_ImageData[index] = Utils::ConvertToRGBA(ToneMapping::Resolve(m_AccumulationData[index], m_Settings));
+		for (uint32_t s = 0; s < frame.SampleCount; s++) {
+			PathSample sample = PerPixel(x, y, frame.FirstSampleIndex + s);
+			float luminance = BSDF::Luminance(sample.Radiance);
+			m_AccumulationData[index] += glm::vec4(sample.Radiance, 1.0f);
+			m_AlbedoDepthData[index] += glm::vec4(sample.Albedo, sample.Depth);
+			m_NormalMomentData[index] += glm::vec4(sample.Normal, luminance * luminance);
+		}
+		if (!denoise)
+			m_ImageData[index] = Utils::ConvertToRGBA(ToneMapping::Resolve(m_AccumulationData[index], m_Settings));
 	});
+
+	if (denoise) {
+		// The filter is expensive on the CPU: only rerun it when the samples or its settings changed
+		const RenderSettings& last = m_DenoisedSettings;
+		bool settingsChanged = last.DenoiseIterations != m_Settings.DenoiseIterations || last.DenoiseColorSigma != m_Settings.DenoiseColorSigma
+			|| last.DenoiseNormalSigma != m_Settings.DenoiseNormalSigma || last.DenoiseDepthSigma != m_Settings.DenoiseDepthSigma;
+		if (!m_DenoisedValid || frame.SampleCount > 0 || settingsChanged) {
+			DenoiserInput input;
+			input.Width = width;
+			input.Height = m_FinalImage->GetHeight();
+			input.Color = m_AccumulationData;
+			input.AlbedoDepth = m_AlbedoDepthData.data();
+			input.NormalMoment = m_NormalMomentData.data();
+			m_Denoiser->Denoise(input, m_Settings, m_DenoisedData.data());
+			m_DenoisedSettings = m_Settings;
+			m_DenoisedValid = true;
+		}
+
+		Utils::ForEachPixel(m_ImageHorizontalIter, m_ImageVerticalIter, [this, width](uint32_t x, uint32_t y) {
+			uint32_t index = x + y * width;
+			glm::vec3 color = ToneMapping::Apply(m_DenoisedData[index], m_Settings.Exposure, m_Settings.ToneMapping, m_Settings.SRGBOutput);
+			m_ImageData[index] = Utils::ConvertToRGBA(glm::vec4(color, 1.0f));
+		});
+	}
+	else {
+		m_DenoisedValid = false;
+	}
 
 	m_FinalImage->SetData(m_ImageData);
 }
@@ -559,7 +622,18 @@ bool Renderer::SaveImage(const std::string& path) {
 
 	if (extension == ".hdr") {
 		std::vector<glm::vec4> accumulation;
-		if (m_Settings.UseGPU)
+		if (m_Settings.Denoise) {
+			// Linear denoised colors, as a sum of one "sample" so the averaging below leaves them as they are
+			if (m_Settings.UseGPU) {
+				m_GpuPathTracer.ReadDenoisedImage(accumulation);
+			}
+			else {
+				accumulation.resize(pixelCount);
+				for (size_t i = 0; i < pixelCount; i++)
+					accumulation[i] = glm::vec4(m_DenoisedData[i], 1.0f);
+			}
+		}
+		else if (m_Settings.UseGPU)
 			m_GpuPathTracer.ReadAccumulationImage(accumulation);
 		else
 			accumulation.assign(m_AccumulationData, m_AccumulationData + pixelCount);

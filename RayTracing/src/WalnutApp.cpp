@@ -30,6 +30,7 @@ using namespace Walnut;
 //   --render <out.png|.hdr>    render until --samples <n> samples per pixel have accumulated, save, exit
 //   --cpu / --gpu              pick the render path
 //   --no-light-sampling        disable next-event estimation (for checking it doesn't change the result)
+//   --denoise                  enable the denoiser
 //   --compare split|difference CPU vs GPU compare view
 struct AppOptions {
 	std::string ScenePath;
@@ -39,6 +40,7 @@ struct AppOptions {
 	int UseGPU = -1; // -1 = keep the default, 0 = --cpu, 1 = --gpu
 	CompareMode Compare = CompareMode::Off; // --compare split|difference
 	bool DisableLightSampling = false;
+	bool Denoise = false;
 };
 
 static AppOptions ParseCommandLine(int argc, char** argv) {
@@ -60,6 +62,8 @@ static AppOptions ParseCommandLine(int argc, char** argv) {
 			options.UseGPU = 0;
 		else if (strcmp(arg, "--no-light-sampling") == 0)
 			options.DisableLightSampling = true;
+		else if (strcmp(arg, "--denoise") == 0)
+			options.Denoise = true;
 		else if (strcmp(arg, "--compare") == 0 && hasValue) {
 			const char* mode = argv[++i];
 			options.Compare = strcmp(mode, "split") == 0 ? CompareMode::Split : strcmp(mode, "difference") == 0 ? CompareMode::Difference : CompareMode::Off;
@@ -88,6 +92,8 @@ public:
 		m_Renderer.GetSettings().Compare = m_Options.Compare;
 		if (m_Options.DisableLightSampling)
 			m_Renderer.GetSettings().LightSampling = false;
+		if (m_Options.Denoise)
+			m_Renderer.GetSettings().Denoise = true;
 		if (!m_Options.RenderOutputPath.empty())
 			m_Renderer.GetSettings().MaxSamples = m_Options.RenderSamples;
 
@@ -365,6 +371,18 @@ private:
 				changed |= ImGui::SliderInt("RR Start Bounce", &settings.RussianRouletteStartBounce, 0, 16);
 			if (changed)
 				m_Renderer.ResetFrameIndex();
+		}
+
+		if (ImGui::CollapsingHeader("Denoiser", ImGuiTreeNodeFlags_DefaultOpen)) {
+			// Runs on the accumulated image, so none of these restart accumulation
+			Renderer::Settings& settings = m_Renderer.GetSettings();
+			ImGui::Checkbox("Denoise", &settings.Denoise);
+			ImGui::BeginDisabled(!settings.Denoise);
+			ImGui::SliderInt("Passes", &settings.DenoiseIterations, 1, 8);
+			ImGui::SliderFloat("Color Sigma", &settings.DenoiseColorSigma, 0.1f, 64.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+			ImGui::SliderFloat("Normal Sigma", &settings.DenoiseNormalSigma, 1.0f, 256.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
+			ImGui::SliderFloat("Depth Sigma", &settings.DenoiseDepthSigma, 0.1f, 16.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+			ImGui::EndDisabled();
 		}
 
 		if (ImGui::CollapsingHeader("Post-processing", ImGuiTreeNodeFlags_DefaultOpen)) {

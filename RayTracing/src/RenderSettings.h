@@ -41,6 +41,14 @@ struct RenderSettings {
 	bool RussianRoulette = true;
 	int RussianRouletteStartBounce = 3; // paths are never terminated before this bounce
 
+	// Denoiser: a-trous wavelet filter guided by first-surface albedo / normal / depth (see Denoiser.h). Runs on the
+	// accumulated image, so changing these never restarts accumulation.
+	bool Denoise = false;
+	int DenoiseIterations = 5;       // filter radius doubles with each pass
+	float DenoiseColorSigma = 4.0f;  // how many noise standard deviations of luminance difference to blur across
+	float DenoiseNormalSigma = 64.0f; // exponent on the normals' dot product: higher = stricter at creases
+	float DenoiseDepthSigma = 1.0f;   // tolerated depth difference, in percent of depth per pixel of distance
+
 	// Post-processing (applied to the accumulated image, so changing these never restarts accumulation)
 	float Exposure = 0.0f; // in stops (EV)
 	ToneMapper ToneMapping = ToneMapper::ACES;

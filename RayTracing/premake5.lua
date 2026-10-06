@@ -34,7 +34,8 @@ project "RayTracing"
 
    -- Compile the GPU compute shader to SPIR-V on every build (Vulkan SDK's glslc, already required to build this project).
    prebuildcommands {
-      '"%{VULKAN_SDK}/Bin/glslc.exe" "%{wks.location}/RayTracing/src/shaders/PathTrace.comp" -o "%{wks.location}/RayTracing/src/shaders/PathTrace.comp.spv"'
+      '"%{VULKAN_SDK}/Bin/glslc.exe" "%{wks.location}/RayTracing/src/shaders/PathTrace.comp" -o "%{wks.location}/RayTracing/src/shaders/PathTrace.comp.spv"',
+      '"%{VULKAN_SDK}/Bin/glslc.exe" "%{wks.location}/RayTracing/src/shaders/Denoise.comp" -o "%{wks.location}/RayTracing/src/shaders/Denoise.comp.spv"'
    }
 
    filter "system:windows"

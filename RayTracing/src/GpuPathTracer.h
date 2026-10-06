@@ -31,6 +31,7 @@ public:
 	// Synchronous GPU -> CPU copies of the current images (rows bottom-up, like the CPU path's buffers)
 	void ReadDisplayImage(std::vector<uint32_t>& pixels);        // tone mapped RGBA8
 	void ReadAccumulationImage(std::vector<glm::vec4>& pixels);  // rgb = radiance sum, a = sample count
+	void ReadDenoisedImage(std::vector<glm::vec4>& pixels);      // rgb = linear denoised color, a = 1
 
 	VkDescriptorSet GetDescriptorSet() const { return m_DisplayDescriptorSet; }
 	uint32_t GetWidth() const { return m_Width; }
@@ -52,6 +53,8 @@ private:
 	};
 
 	void Init();
+	void InitDenoiser();
+	void Denoise(VkCommandBuffer commandBuffer, const RenderSettings& settings);
 	void UploadGeometry(const Scene& scene);
 	void UploadEnvironment(const SkySettings& sky);
 	void CreateImages(uint32_t width, uint32_t height);
@@ -64,7 +67,7 @@ private:
 	void UploadStatic(Buffer& buffer, uint32_t binding, const void* data, VkDeviceSize size);
 	static void ReleaseBuffer(Buffer& buffer); // deferred until the GPU is done with it
 	void WriteBufferDescriptor(uint32_t binding, VkDescriptorType type, const Buffer& buffer);
-	void WriteImageDescriptor(uint32_t binding, VkImageView view);
+	void WriteImageDescriptor(VkDescriptorSet set, uint32_t binding, VkImageView view);
 
 	void ReadImage(VkImage image, VkDeviceSize bytesPerPixel, void* destination);
 
@@ -107,9 +110,22 @@ private:
 	bool m_EnvironmentUploaded = false;
 	uint64_t m_UploadedEnvironmentVersion = 0; // 0 = none (placeholder buffers)
 
+	// Denoiser pipeline (shaders/Denoise.comp), run as several passes after path tracing
+	VkShaderModule m_DenoiseShaderModule = VK_NULL_HANDLE;
+	VkDescriptorSetLayout m_DenoiseDescriptorSetLayout = VK_NULL_HANDLE;
+	VkPipelineLayout m_DenoisePipelineLayout = VK_NULL_HANDLE;
+	VkPipeline m_DenoisePipeline = VK_NULL_HANDLE;
+	VkDescriptorPool m_DenoiseDescriptorPool = VK_NULL_HANDLE;
+	VkDescriptorSet m_DenoiseDescriptorSet = VK_NULL_HANDLE;
+	uint32_t m_LastDenoiseIterations = 0;
+
 	// Per-resize resources
-	StorageImage m_AccumulationImage; // rgba32f: rgb = radiance sum, a = sample count
-	StorageImage m_DisplayImage;      // rgba8: tone mapped, sampled by ImGui
+	StorageImage m_AccumulationImage;  // rgba32f: rgb = radiance sum, a = sample count
+	StorageImage m_DisplayImage;       // rgba8: tone mapped, sampled by ImGui
+	StorageImage m_AlbedoDepthImage;   // rgba32f: denoiser features, accumulated like the color
+	StorageImage m_NormalMomentImage;  // rgba32f
+	StorageImage m_PingImage;          // rgba32f: denoiser passes alternate between these two
+	StorageImage m_PongImage;
 	VkSampler m_DisplaySampler = VK_NULL_HANDLE;
 	VkDescriptorSet m_DisplayDescriptorSet = VK_NULL_HANDLE; // ImGui texture id
 };

@@ -33,6 +33,8 @@ namespace {
 			EnvironmentConditional = 13,
 			EnvironmentPdf = 14,
 			BVHNodes = 15,         // SSBO: all meshes' BVH nodes
+			AlbedoDepthImage = 16, // storage image, rgba32f: denoiser features
+			NormalMomentImage = 17,
 			Count
 		};
 	}
@@ -54,7 +56,12 @@ namespace {
 		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+		VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
 	};
+
+	// Denoise.comp's bindings: accumulation, albedo/depth, normal/moment, ping, pong (all rgba32f), display (rgba8)
+	constexpr uint32_t DenoiseBindingCount = 6;
 
 	// Mirrors the std430/std140 layouts declared in PathTrace.comp
 	struct SphereGPU {
@@ -129,6 +136,20 @@ namespace {
 		uint32_t InstanceCount;
 		uint32_t LightCount;
 		uint32_t LightSampling;
+		uint32_t WriteDisplay; // 0 when the denoiser writes the display image instead
+	};
+
+	struct DenoisePushConstants {
+		uint32_t Width;
+		uint32_t Height;
+		uint32_t Iteration;
+		uint32_t IterationCount;
+		float ColorSigma;
+		float NormalSigma;
+		float DepthSigma;
+		float Exposure;
+		uint32_t ToneMapper;
+		uint32_t SRGBOutput;
 	};
 
 	uint32_t FindMemoryType(VkMemoryPropertyFlags properties, uint32_t typeBits)
@@ -255,6 +276,39 @@ namespace {
 		return shaderModule;
 	}
 
+	void CreateComputePipeline(VkShaderModule module, VkDescriptorSetLayout setLayout, uint32_t pushConstantSize,
+		VkPipelineLayout& pipelineLayout, VkPipeline& pipeline)
+	{
+		VkDevice device = Walnut::Application::GetDevice();
+
+		VkPushConstantRange pushConstantRange{};
+		pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+		pushConstantRange.offset = 0;
+		pushConstantRange.size = pushConstantSize;
+
+		VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+		pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+		pipelineLayoutInfo.setLayoutCount = 1;
+		pipelineLayoutInfo.pSetLayouts = &setLayout;
+		pipelineLayoutInfo.pushConstantRangeCount = 1;
+		pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
+		VkResult err = vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout);
+		check_vk_result(err);
+
+		VkPipelineShaderStageCreateInfo stageInfo{};
+		stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+		stageInfo.module = module;
+		stageInfo.pName = "main";
+
+		VkComputePipelineCreateInfo pipelineInfo{};
+		pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+		pipelineInfo.stage = stageInfo;
+		pipelineInfo.layout = pipelineLayout;
+		err = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
+		check_vk_result(err);
+	}
+
 	VkBufferUsageFlags GetBufferUsage(VkDescriptorType type)
 	{
 		return type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT : VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
@@ -302,9 +356,17 @@ GpuPathTracer::~GpuPathTracer()
 
 	Walnut::Application::SubmitResourceFree([shaderModule = m_ShaderModule, pipeline = m_Pipeline,
 		pipelineLayout = m_PipelineLayout, descriptorSetLayout = m_DescriptorSetLayout, descriptorPool = m_DescriptorPool,
-		sampler = m_DisplaySampler, buffers]()
+		sampler = m_DisplaySampler, buffers, denoiseShaderModule = m_DenoiseShaderModule, denoisePipeline = m_DenoisePipeline,
+		denoisePipelineLayout = m_DenoisePipelineLayout, denoiseSetLayout = m_DenoiseDescriptorSetLayout,
+		denoisePool = m_DenoiseDescriptorPool]()
 	{
 		VkDevice device = Walnut::Application::GetDevice();
+
+		vkDestroyPipeline(device, denoisePipeline, nullptr);
+		vkDestroyPipelineLayout(device, denoisePipelineLayout, nullptr);
+		vkDestroyDescriptorSetLayout(device, denoiseSetLayout, nullptr);
+		vkDestroyDescriptorPool(device, denoisePool, nullptr);
+		vkDestroyShaderModule(device, denoiseShaderModule, nullptr);
 
 		vkDestroyPipeline(device, pipeline, nullptr);
 		vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
@@ -344,32 +406,7 @@ void GpuPathTracer::Init()
 	VkResult err = vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_DescriptorSetLayout);
 	check_vk_result(err);
 
-	VkPushConstantRange pushConstantRange{};
-	pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	pushConstantRange.offset = 0;
-	pushConstantRange.size = sizeof(PushConstants);
-
-	VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
-	pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-	pipelineLayoutInfo.setLayoutCount = 1;
-	pipelineLayoutInfo.pSetLayouts = &m_DescriptorSetLayout;
-	pipelineLayoutInfo.pushConstantRangeCount = 1;
-	pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
-	err = vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &m_PipelineLayout);
-	check_vk_result(err);
-
-	VkPipelineShaderStageCreateInfo stageInfo{};
-	stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-	stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-	stageInfo.module = m_ShaderModule;
-	stageInfo.pName = "main";
-
-	VkComputePipelineCreateInfo pipelineInfo{};
-	pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-	pipelineInfo.stage = stageInfo;
-	pipelineInfo.layout = m_PipelineLayout;
-	err = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline);
-	check_vk_result(err);
+	CreateComputePipeline(m_ShaderModule, m_DescriptorSetLayout, sizeof(PushConstants), m_PipelineLayout, m_Pipeline);
 
 	// One pool entry per binding of each type
 	std::vector<VkDescriptorPoolSize> poolSizes;
@@ -398,7 +435,81 @@ void GpuPathTracer::Init()
 	err = vkAllocateDescriptorSets(device, &dsAllocInfo, &m_DescriptorSet);
 	check_vk_result(err);
 
+	InitDenoiser();
+
 	m_Initialized = true;
+}
+
+void GpuPathTracer::InitDenoiser()
+{
+	VkDevice device = Walnut::Application::GetDevice();
+
+	m_DenoiseShaderModule = CreateShaderModule(ReadFile("src/shaders/Denoise.comp.spv"));
+
+	VkDescriptorSetLayoutBinding bindings[DenoiseBindingCount]{};
+	for (uint32_t i = 0; i < DenoiseBindingCount; i++)
+		bindings[i] = { i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+
+	VkDescriptorSetLayoutCreateInfo layoutInfo{};
+	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	layoutInfo.bindingCount = DenoiseBindingCount;
+	layoutInfo.pBindings = bindings;
+	VkResult err = vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_DenoiseDescriptorSetLayout);
+	check_vk_result(err);
+
+	CreateComputePipeline(m_DenoiseShaderModule, m_DenoiseDescriptorSetLayout, sizeof(DenoisePushConstants), m_DenoisePipelineLayout, m_DenoisePipeline);
+
+	VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, DenoiseBindingCount };
+	VkDescriptorPoolCreateInfo poolInfo{};
+	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	poolInfo.maxSets = 1;
+	poolInfo.poolSizeCount = 1;
+	poolInfo.pPoolSizes = &poolSize;
+	err = vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_DenoiseDescriptorPool);
+	check_vk_result(err);
+
+	VkDescriptorSetAllocateInfo allocInfo{};
+	allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	allocInfo.descriptorPool = m_DenoiseDescriptorPool;
+	allocInfo.descriptorSetCount = 1;
+	allocInfo.pSetLayouts = &m_DenoiseDescriptorSetLayout;
+	err = vkAllocateDescriptorSets(device, &allocInfo, &m_DenoiseDescriptorSet);
+	check_vk_result(err);
+}
+
+void GpuPathTracer::Denoise(VkCommandBuffer commandBuffer, const RenderSettings& settings)
+{
+	uint32_t iterations = (uint32_t)std::clamp(settings.DenoiseIterations, 1, 8);
+
+	vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_DenoisePipeline);
+	vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_DenoisePipelineLayout, 0, 1, &m_DenoiseDescriptorSet, 0, nullptr);
+
+	DenoisePushConstants pushConstants{};
+	pushConstants.Width = m_Width;
+	pushConstants.Height = m_Height;
+	pushConstants.IterationCount = iterations;
+	pushConstants.ColorSigma = settings.DenoiseColorSigma;
+	pushConstants.NormalSigma = settings.DenoiseNormalSigma;
+	pushConstants.DepthSigma = settings.DenoiseDepthSigma;
+	pushConstants.Exposure = settings.Exposure;
+	pushConstants.ToneMapper = (uint32_t)settings.ToneMapping;
+	pushConstants.SRGBOutput = settings.SRGBOutput ? 1u : 0u;
+
+	for (uint32_t iteration = 0; iteration < iterations; iteration++)
+	{
+		// The previous pass's writes (the path tracer's, or the last filter pass's) must land before this one reads
+		VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+		barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+		pushConstants.Iteration = iteration;
+		vkCmdPushConstants(commandBuffer, m_DenoisePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DenoisePushConstants), &pushConstants);
+		vkCmdDispatch(commandBuffer, (m_Width + 7) / 8, (m_Height + 7) / 8, 1);
+	}
+
+	m_LastDenoiseIterations = iterations;
 }
 
 void GpuPathTracer::UploadGeometry(const Scene& scene)
@@ -548,12 +659,12 @@ void GpuPathTracer::WriteBufferDescriptor(uint32_t binding, VkDescriptorType typ
 	vkUpdateDescriptorSets(Walnut::Application::GetDevice(), 1, &write, 0, nullptr);
 }
 
-void GpuPathTracer::WriteImageDescriptor(uint32_t binding, VkImageView view)
+void GpuPathTracer::WriteImageDescriptor(VkDescriptorSet set, uint32_t binding, VkImageView view)
 {
 	VkDescriptorImageInfo imageInfo{ VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL };
 
 	VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-	write.dstSet = m_DescriptorSet;
+	write.dstSet = set;
 	write.dstBinding = binding;
 	write.descriptorCount = 1;
 	write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -563,10 +674,11 @@ void GpuPathTracer::WriteImageDescriptor(uint32_t binding, VkImageView view)
 
 void GpuPathTracer::ReleaseImages()
 {
-	Walnut::Application::SubmitResourceFree([accumulation = m_AccumulationImage, display = m_DisplayImage]()
+	Walnut::Application::SubmitResourceFree([images = std::vector<StorageImage>{ m_AccumulationImage, m_DisplayImage,
+		m_AlbedoDepthImage, m_NormalMomentImage, m_PingImage, m_PongImage }]()
 	{
 		VkDevice device = Walnut::Application::GetDevice();
-		for (const StorageImage& image : { accumulation, display })
+		for (const StorageImage& image : images)
 		{
 			vkDestroyImageView(device, image.View, nullptr);
 			vkDestroyImage(device, image.Image, nullptr);
@@ -576,6 +688,10 @@ void GpuPathTracer::ReleaseImages()
 
 	m_AccumulationImage = {};
 	m_DisplayImage = {};
+	m_AlbedoDepthImage = {};
+	m_NormalMomentImage = {};
+	m_PingImage = {};
+	m_PongImage = {};
 }
 
 void GpuPathTracer::CreateImages(uint32_t width, uint32_t height)
@@ -590,6 +706,10 @@ void GpuPathTracer::CreateImages(uint32_t width, uint32_t height)
 	CreateStorageImage(width, height, VK_FORMAT_R8G8B8A8_UNORM,
 		VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 		m_DisplayImage.Image, m_DisplayImage.Memory, m_DisplayImage.View);
+
+	for (StorageImage* image : { &m_AlbedoDepthImage, &m_NormalMomentImage, &m_PingImage, &m_PongImage })
+		CreateStorageImage(width, height, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+			image->Image, image->Memory, image->View);
 
 	if (m_DisplaySampler == VK_NULL_HANDLE)
 	{
@@ -608,11 +728,11 @@ void GpuPathTracer::CreateImages(uint32_t width, uint32_t height)
 		check_vk_result(err);
 	}
 
-	// Transition both images UNDEFINED -> GENERAL: GENERAL supports both compute shader read/write
+	// Transition the images UNDEFINED -> GENERAL: GENERAL supports both compute shader read/write
 	// and being sampled by ImGui's fragment shader, so it never needs to change again.
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
-	VkImageMemoryBarrier barriers[2]{};
+	VkImageMemoryBarrier barriers[6]{};
 	for (auto& b : barriers)
 	{
 		b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -627,17 +747,28 @@ void GpuPathTracer::CreateImages(uint32_t width, uint32_t height)
 	}
 	barriers[0].image = m_AccumulationImage.Image;
 	barriers[1].image = m_DisplayImage.Image;
+	barriers[2].image = m_AlbedoDepthImage.Image;
+	barriers[3].image = m_NormalMomentImage.Image;
+	barriers[4].image = m_PingImage.Image;
+	barriers[5].image = m_PongImage.Image;
 
 	vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		0, 0, nullptr, 0, nullptr, 2, barriers);
+		0, 0, nullptr, 0, nullptr, 6, barriers);
 
 	Walnut::Application::FlushCommandBuffer(commandBuffer);
 
 	// Register the display image directly with ImGui - no CPU readback, no Walnut::Image involved.
 	m_DisplayDescriptorSet = (VkDescriptorSet)ImGui_ImplVulkan_AddTexture(m_DisplaySampler, m_DisplayImage.View, VK_IMAGE_LAYOUT_GENERAL);
 
-	WriteImageDescriptor(Binding::AccumulationImage, m_AccumulationImage.View);
-	WriteImageDescriptor(Binding::DisplayImage, m_DisplayImage.View);
+	WriteImageDescriptor(m_DescriptorSet, Binding::AccumulationImage, m_AccumulationImage.View);
+	WriteImageDescriptor(m_DescriptorSet, Binding::DisplayImage, m_DisplayImage.View);
+	WriteImageDescriptor(m_DescriptorSet, Binding::AlbedoDepthImage, m_AlbedoDepthImage.View);
+	WriteImageDescriptor(m_DescriptorSet, Binding::NormalMomentImage, m_NormalMomentImage.View);
+
+	const StorageImage* denoiseImages[DenoiseBindingCount] = { &m_AccumulationImage, &m_AlbedoDepthImage, &m_NormalMomentImage,
+		&m_PingImage, &m_PongImage, &m_DisplayImage };
+	for (uint32_t i = 0; i < DenoiseBindingCount; i++)
+		WriteImageDescriptor(m_DenoiseDescriptorSet, i, denoiseImages[i]->View);
 }
 
 void GpuPathTracer::ReadImage(VkImage image, VkDeviceSize bytesPerPixel, void* destination)
@@ -706,6 +837,16 @@ void GpuPathTracer::ReadAccumulationImage(std::vector<glm::vec4>& pixels)
 	pixels.resize((size_t)m_Width * m_Height);
 	if (m_AccumulationImage.Image != VK_NULL_HANDLE)
 		ReadImage(m_AccumulationImage.Image, sizeof(glm::vec4), pixels.data());
+}
+
+void GpuPathTracer::ReadDenoisedImage(std::vector<glm::vec4>& pixels)
+{
+	pixels.resize((size_t)m_Width * m_Height);
+	if (m_LastDenoiseIterations == 0)
+		return;
+	// The last pass wrote its linear output to whichever image it would have handed to the next pass
+	const StorageImage& image = (m_LastDenoiseIterations - 1) % 2 == 0 ? m_PingImage : m_PongImage;
+	ReadImage(image.Image, sizeof(glm::vec4), pixels.data());
 }
 
 void GpuPathTracer::OnResize(uint32_t width, uint32_t height)
@@ -821,6 +962,7 @@ void GpuPathTracer::Render(const Scene& scene, const PreparedScene& prepared, co
 	pushConstants.InstanceCount = (uint32_t)instances.size();
 	pushConstants.LightCount = (uint32_t)lights.size();
 	pushConstants.LightSampling = settings.LightSampling ? 1u : 0u;
+	pushConstants.WriteDisplay = settings.Denoise ? 0u : 1u;
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
@@ -831,6 +973,9 @@ void GpuPathTracer::Render(const Scene& scene, const PreparedScene& prepared, co
 	uint32_t groupsX = (m_Width + 7) / 8;
 	uint32_t groupsY = (m_Height + 7) / 8;
 	vkCmdDispatch(commandBuffer, groupsX, groupsY, 1);
+
+	if (settings.Denoise)
+		Denoise(commandBuffer, settings);
 
 	// Make the compute writes to DisplayImage visible to the fragment shader ImGui uses to sample it
 	VkImageMemoryBarrier barrier{};
