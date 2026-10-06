@@ -824,6 +824,11 @@ Walnut::Application* Walnut::CreateApplication(int argc, char** argv) {
 	Walnut::Application* app = new Walnut::Application(spec);
 	std::shared_ptr<AppLayer> layer = std::make_shared<AppLayer>(ParseCommandLine(argc, argv));
 	app->PushLayer(layer);
-	app->SetMenubarCallback([layer]() { layer->OnMenuBar(); });
+	// Only a weak reference: the layer (and with it the renderer's GPU resources) must be destroyed when Walnut clears
+	// its layer stack during shutdown, while the device is still alive - not later along with the Application
+	app->SetMenubarCallback([weakLayer = std::weak_ptr<AppLayer>(layer)]() {
+		if (std::shared_ptr<AppLayer> layer = weakLayer.lock())
+			layer->OnMenuBar();
+	});
 	return app;
 }
