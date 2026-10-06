@@ -53,11 +53,16 @@ private:
 
 	void Init();
 	void UploadGeometry(const Scene& scene);
+	void UploadEnvironment(const SkySettings& sky);
 	void CreateImages(uint32_t width, uint32_t height);
 	void ReleaseImages();
 
 	// Makes sure buffer holds at least size bytes (reallocating and re-binding it if not), then copies data in
 	void Upload(Buffer& buffer, uint32_t binding, VkDescriptorType type, const void* data, VkDeviceSize size);
+	// Replaces buffer with a device-local storage buffer filled through a staging copy, for big data that rarely
+	// changes (mesh geometry, environment maps) - fast to read even without resizable BAR
+	void UploadStatic(Buffer& buffer, uint32_t binding, const void* data, VkDeviceSize size);
+	static void ReleaseBuffer(Buffer& buffer); // deferred until the GPU is done with it
 	void WriteBufferDescriptor(uint32_t binding, VkDescriptorType type, const Buffer& buffer);
 	void WriteImageDescriptor(uint32_t binding, VkImageView view);
 
@@ -91,6 +96,14 @@ private:
 	bool m_GeometryUploaded = false;
 	uint64_t m_UploadedGeometryVersion = 0;
 	std::vector<uint32_t> m_MeshFirstTriangle; // per mesh, into the concatenated index buffer
+
+	// Environment map + sampling tables, only re-uploaded when the map changes
+	Buffer m_EnvironmentTexelBuffer;
+	Buffer m_EnvironmentMarginalBuffer;
+	Buffer m_EnvironmentConditionalBuffer;
+	Buffer m_EnvironmentPdfBuffer;
+	bool m_EnvironmentUploaded = false;
+	uint64_t m_UploadedEnvironmentVersion = 0; // 0 = none (placeholder buffers)
 
 	// Per-resize resources
 	StorageImage m_AccumulationImage; // rgba32f: rgb = radiance sum, a = sample count

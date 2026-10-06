@@ -1,6 +1,7 @@
 #include "Renderer.h"
 
 #include "BSDF.h"
+#include "EnvironmentSampling.h"
 #include "ImageExport.h"
 #include "Intersection.h"
 #include "LightSampling.h"
@@ -28,9 +29,10 @@ namespace Utils {
 		return (word >> 22u) ^ word;
 	}
 
+	// Uniform in [0, 1): the top 24 bits fit a float's mantissa exactly, so the result can never round up to 1
 	static float RandomFloat(uint32_t& seed) {
 		seed = PCG_Hash(seed);
-		return (float)seed / (float)std::numeric_limits<uint32_t>::max();
+		return (float)(seed >> 8) * (1.0f / 16777216.0f);
 	}
 
 #define MT 1
@@ -143,14 +145,20 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex) {
 	glm::vec3 light(0.0f);
 	glm::vec3 contribution(1.0f);
 
-	bool lightSampling = m_Settings.LightSampling && !m_Prepared.Lights.empty();
+	bool lightSampling = m_Settings.LightSampling && m_Prepared.HasLights();
 	float previousPdf = 0.0f;   // pdf of the BSDF sample that led to the current hit
 	bool previousDelta = true;  // ...or it came from a delta lobe / the camera, which light sampling can't produce
 
 	for (int i = 0; i < m_Settings.MaxBounces; i++) {
 		Renderer::HitPayload payload = TraceRay(ray);
 		if (payload.HitDistance < 0.0f) {
-			light += m_ActiveScene->Sky.GetRadiance(ray.Direction) * contribution;
+			// An environment map is also a light that light sampling aims at: share it via MIS
+			float weight = 1.0f;
+			if (lightSampling && !previousDelta && m_Prepared.EnvironmentProbability > 0.0f) {
+				float lightPdf = m_Prepared.EnvironmentProbability * EnvironmentSampling::Pdf(*m_Prepared.Environment, ray.Direction, m_Prepared.EnvironmentRotation);
+				weight = LightSampling::PowerHeuristic(previousPdf, lightPdf);
+			}
+			light += m_ActiveScene->Sky.GetRadiance(ray.Direction) * contribution * weight;
 			break;
 		}
 
@@ -239,7 +247,37 @@ glm::vec3 Renderer::SampleDirectLight(const glm::vec3& origin, const glm::vec3& 
 	float u1 = RandomFloat(seed);
 	float u2 = RandomFloat(seed);
 
-	const PreparedScene::Light& light = m_Prepared.Lights[m_Prepared.SelectLight(uLight)];
+	float environmentProbability = m_Prepared.EnvironmentProbability;
+	if (uLight < environmentProbability) {
+		glm::vec3 direction;
+		float pdf;
+		if (!EnvironmentSampling::Sample(*m_Prepared.Environment, m_Prepared.EnvironmentRotation, u1, u2, direction, pdf))
+			return glm::vec3(0.0f);
+		if (glm::dot(direction, geometricNormal) <= 0.0f)
+			return glm::vec3(0.0f);
+
+		glm::vec3 f = BSDF::Evaluate(material, normal, wo, direction);
+		if (f.r <= 0.0f && f.g <= 0.0f && f.b <= 0.0f)
+			return glm::vec3(0.0f);
+
+		// Visible if the shadow ray escapes the scene
+		Ray shadowRay;
+		shadowRay.Origin = origin;
+		shadowRay.Direction = direction;
+		if (TraceRay(shadowRay).HitDistance >= 0.0f)
+			return glm::vec3(0.0f);
+
+		float lightPdf = environmentProbability * pdf;
+		float weight = LightSampling::PowerHeuristic(lightPdf, BSDF::Pdf(material, normal, wo, direction));
+		glm::vec3 radiance = EnvironmentSampling::Lookup(*m_Prepared.Environment, direction, m_Prepared.EnvironmentRotation) * m_Prepared.EnvironmentIntensity;
+		return f * radiance * (weight / lightPdf);
+	}
+
+	if (m_Prepared.Lights.empty())
+		return glm::vec3(0.0f);
+
+	// Reuse uLight (rescaled to [0,1)) to pick among the scene's lights
+	const PreparedScene::Light& light = m_Prepared.Lights[m_Prepared.SelectLight((uLight - environmentProbability) / (1.0f - environmentProbability))];
 
 	glm::vec3 direction;
 	float pdf;
@@ -271,7 +309,7 @@ glm::vec3 Renderer::SampleDirectLight(const glm::vec3& origin, const glm::vec3& 
 	if (!visible)
 		return glm::vec3(0.0f);
 
-	float lightPdf = light.Probability * pdf;
+	float lightPdf = (1.0f - environmentProbability) * light.Probability * pdf;
 	float weight = LightSampling::PowerHeuristic(lightPdf, BSDF::Pdf(material, normal, wo, direction));
 	return f * light.Emission * (weight / lightPdf);
 }
@@ -282,7 +320,7 @@ float Renderer::LightPdf(const HitPayload& hit, const Ray& ray) const {
 		if (lightIndex < 0)
 			return 0.0f;
 		const PreparedScene::Light& light = m_Prepared.Lights[lightIndex];
-		return light.Probability * LightSampling::SpherePdf(ray.Origin, light.Position0, light.Radius);
+		return (1.0f - m_Prepared.EnvironmentProbability) * light.Probability * LightSampling::SpherePdf(ray.Origin, light.Position0, light.Radius);
 	}
 	if (hit.Object.Type == ObjectType::MeshInstance) {
 		int lightOffset = m_Prepared.InstanceLightOffsets[hit.Object.Index];
@@ -290,7 +328,7 @@ float Renderer::LightPdf(const HitPayload& hit, const Ray& ray) const {
 			return 0.0f;
 		const PreparedScene::Light& light = m_Prepared.Lights[lightOffset + hit.Triangle];
 		float cosLight = glm::abs(glm::dot(hit.GeometricNormal, ray.Direction));
-		return light.Probability * LightSampling::TrianglePdf(hit.HitDistance, cosLight, light.Area);
+		return (1.0f - m_Prepared.EnvironmentProbability) * light.Probability * LightSampling::TrianglePdf(hit.HitDistance, cosLight, light.Area);
 	}
 	return 0.0f; // planes aren't in the light list
 }

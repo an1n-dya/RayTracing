@@ -80,6 +80,14 @@ void PreparedScene::Prepare(const Scene& scene) {
 	}
 	if (!LightCDF.empty())
 		LightCDF.back() = 1.0f; // guard against rounding leaving the last entry just below 1
+
+	// The environment can't be compared by power with finite lights, so it simply gets half the samples
+	const SkySettings& sky = scene.Sky;
+	bool sampleEnvironment = sky.HasEnvironmentMap() && sky.Environment->IsSampleable() && sky.Intensity > 0.0f;
+	Environment = sampleEnvironment ? sky.Environment.get() : nullptr;
+	EnvironmentRotation = sky.EnvironmentRotation / 360.0f;
+	EnvironmentIntensity = sky.Intensity;
+	EnvironmentProbability = sampleEnvironment ? (Lights.empty() ? 1.0f : 0.5f) : 0.0f;
 }
 
 uint32_t PreparedScene::SelectLight(float u) const {

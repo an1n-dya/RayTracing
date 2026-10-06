@@ -28,6 +28,10 @@ namespace {
 			Indices = 8,           // SSBO: all meshes' triangles (global vertex indices)
 			Lights = 9,            // SSBO: PreparedScene::Lights
 			LightCDF = 10,         // SSBO: PreparedScene::LightCDF
+			EnvironmentTexels = 11,      // SSBO: EnvironmentMap texels
+			EnvironmentMarginal = 12,    // SSBO: its sampling tables
+			EnvironmentConditional = 13,
+			EnvironmentPdf = 14,
 			Count
 		};
 	}
@@ -38,6 +42,10 @@ namespace {
 		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 		VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
 		VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -96,6 +104,8 @@ namespace {
 		glm::vec4 SkyTopColor;
 		int32_t SkyMode;
 		int32_t Pad[3];
+		glm::vec4 EnvironmentParams; // x = rotation (turns), y = light sampling probability
+		glm::uvec4 EnvironmentSize;  // xy = width, height (0 = no map)
 	};
 
 	struct PushConstants {
@@ -247,6 +257,32 @@ namespace {
 		return type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT : VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 	}
 
+	void CreateDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buffer, VkDeviceMemory& memory)
+	{
+		VkDevice device = Walnut::Application::GetDevice();
+
+		VkBufferCreateInfo bufferInfo{};
+		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		bufferInfo.size = size;
+		bufferInfo.usage = usage;
+		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		VkResult err = vkCreateBuffer(device, &bufferInfo, nullptr, &buffer);
+		check_vk_result(err);
+
+		VkMemoryRequirements memReq;
+		vkGetBufferMemoryRequirements(device, buffer, &memReq);
+
+		VkMemoryAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocInfo.allocationSize = memReq.size;
+		allocInfo.memoryTypeIndex = FindMemoryType(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memReq.memoryTypeBits);
+		err = vkAllocateMemory(device, &allocInfo, nullptr, &memory);
+		check_vk_result(err);
+
+		err = vkBindBufferMemory(device, buffer, memory, 0);
+		check_vk_result(err);
+	}
+
 }
 
 GpuPathTracer::~GpuPathTracer()
@@ -258,7 +294,8 @@ GpuPathTracer::~GpuPathTracer()
 		ReleaseImages();
 
 	std::vector<Buffer> buffers = { m_FrameBuffer, m_SphereBuffer, m_MaterialBuffer, m_PlaneBuffer, m_InstanceBuffer,
-		m_VertexBuffer, m_IndexBuffer, m_LightBuffer, m_LightCDFBuffer };
+		m_VertexBuffer, m_IndexBuffer, m_LightBuffer, m_LightCDFBuffer, m_EnvironmentTexelBuffer, m_EnvironmentMarginalBuffer,
+		m_EnvironmentConditionalBuffer, m_EnvironmentPdfBuffer };
 
 	Walnut::Application::SubmitResourceFree([shaderModule = m_ShaderModule, pipeline = m_Pipeline,
 		pipelineLayout = m_PipelineLayout, descriptorSetLayout = m_DescriptorSetLayout, descriptorPool = m_DescriptorPool,
@@ -278,7 +315,8 @@ GpuPathTracer::~GpuPathTracer()
 		{
 			if (buffer.Handle == VK_NULL_HANDLE)
 				continue;
-			vkUnmapMemory(device, buffer.Memory);
+			if (buffer.Mapped)
+				vkUnmapMemory(device, buffer.Memory);
 			vkDestroyBuffer(device, buffer.Handle, nullptr);
 			vkFreeMemory(device, buffer.Memory, nullptr);
 		}
@@ -379,11 +417,94 @@ void GpuPathTracer::UploadGeometry(const Scene& scene)
 			indices.push_back(vertexOffset + index);
 	}
 
-	Upload(m_VertexBuffer, Binding::Vertices, BindingTypes[Binding::Vertices], vertices.data(), vertices.size() * sizeof(VertexGPU));
-	Upload(m_IndexBuffer, Binding::Indices, BindingTypes[Binding::Indices], indices.data(), indices.size() * sizeof(uint32_t));
+	UploadStatic(m_VertexBuffer, Binding::Vertices, vertices.data(), vertices.size() * sizeof(VertexGPU));
+	UploadStatic(m_IndexBuffer, Binding::Indices, indices.data(), indices.size() * sizeof(uint32_t));
 
 	m_GeometryUploaded = true;
 	m_UploadedGeometryVersion = scene.GeometryVersion;
+}
+
+void GpuPathTracer::UploadEnvironment(const SkySettings& sky)
+{
+	const EnvironmentMap* map = sky.Environment.get();
+	uint64_t version = map ? map->GetVersion() : 0;
+	if (m_EnvironmentUploaded && m_UploadedEnvironmentVersion == version)
+		return;
+
+	if (map)
+	{
+		UploadStatic(m_EnvironmentTexelBuffer, Binding::EnvironmentTexels, map->GetTexels().data(), map->GetTexels().size() * sizeof(glm::vec4));
+		UploadStatic(m_EnvironmentMarginalBuffer, Binding::EnvironmentMarginal, map->GetMarginalCDF().data(), map->GetMarginalCDF().size() * sizeof(float));
+		UploadStatic(m_EnvironmentConditionalBuffer, Binding::EnvironmentConditional, map->GetConditionalCDF().data(), map->GetConditionalCDF().size() * sizeof(float));
+		UploadStatic(m_EnvironmentPdfBuffer, Binding::EnvironmentPdf, map->GetPdf().data(), map->GetPdf().size() * sizeof(float));
+	}
+	else
+	{
+		// Placeholders keep the bindings valid
+		UploadStatic(m_EnvironmentTexelBuffer, Binding::EnvironmentTexels, nullptr, 0);
+		UploadStatic(m_EnvironmentMarginalBuffer, Binding::EnvironmentMarginal, nullptr, 0);
+		UploadStatic(m_EnvironmentConditionalBuffer, Binding::EnvironmentConditional, nullptr, 0);
+		UploadStatic(m_EnvironmentPdfBuffer, Binding::EnvironmentPdf, nullptr, 0);
+	}
+
+	m_EnvironmentUploaded = true;
+	m_UploadedEnvironmentVersion = version;
+}
+
+void GpuPathTracer::ReleaseBuffer(Buffer& buffer)
+{
+	if (buffer.Handle == VK_NULL_HANDLE)
+		return;
+
+	Walnut::Application::SubmitResourceFree([old = buffer]()
+	{
+		VkDevice device = Walnut::Application::GetDevice();
+		if (old.Mapped)
+			vkUnmapMemory(device, old.Memory);
+		vkDestroyBuffer(device, old.Handle, nullptr);
+		vkFreeMemory(device, old.Memory, nullptr);
+	});
+	buffer = {};
+}
+
+void GpuPathTracer::UploadStatic(Buffer& buffer, uint32_t binding, const void* data, VkDeviceSize size)
+{
+	ReleaseBuffer(buffer);
+
+	buffer.Size = std::max<VkDeviceSize>(size, 256);
+	CreateDeviceLocalBuffer(buffer.Size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, buffer.Handle, buffer.Memory);
+	WriteBufferDescriptor(binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, buffer);
+
+	if (size == 0)
+		return;
+
+	VkDevice device = Walnut::Application::GetDevice();
+	VkBuffer staging;
+	VkDeviceMemory stagingMemory;
+	void* mapped = nullptr;
+	CreateBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging, stagingMemory, &mapped);
+	memcpy(mapped, data, (size_t)size);
+
+	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
+	VkBufferCopy region{ 0, 0, size };
+	vkCmdCopyBuffer(commandBuffer, staging, buffer.Handle, 1, &region);
+
+	VkBufferMemoryBarrier barrier{};
+	barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+	barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer = buffer.Handle;
+	barrier.size = VK_WHOLE_SIZE;
+	vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		0, 0, nullptr, 1, &barrier, 0, nullptr);
+
+	Walnut::Application::FlushCommandBuffer(commandBuffer); // waits, so the staging buffer can go right away
+
+	vkUnmapMemory(device, stagingMemory);
+	vkDestroyBuffer(device, staging, nullptr);
+	vkFreeMemory(device, stagingMemory, nullptr);
 }
 
 void GpuPathTracer::Upload(Buffer& buffer, uint32_t binding, VkDescriptorType type, const void* data, VkDeviceSize size)
@@ -393,18 +514,10 @@ void GpuPathTracer::Upload(Buffer& buffer, uint32_t binding, VkDescriptorType ty
 
 	if (buffer.Handle == VK_NULL_HANDLE || buffer.Size < requiredSize)
 	{
-		if (buffer.Handle != VK_NULL_HANDLE)
-		{
-			Walnut::Application::SubmitResourceFree([old = buffer]()
-			{
-				VkDevice device = Walnut::Application::GetDevice();
-				vkUnmapMemory(device, old.Memory);
-				vkDestroyBuffer(device, old.Handle, nullptr);
-				vkFreeMemory(device, old.Memory, nullptr);
-			});
-		}
+		VkDeviceSize newSize = std::max(requiredSize, buffer.Size * 2); // grow geometrically so adding objects one by one stays cheap
+		ReleaseBuffer(buffer);
 
-		buffer.Size = std::max(requiredSize, buffer.Size * 2); // grow geometrically so adding objects one by one stays cheap
+		buffer.Size = newSize;
 		CreateBuffer(buffer.Size, GetBufferUsage(type), buffer.Handle, buffer.Memory, &buffer.Mapped);
 		WriteBufferDescriptor(binding, type, buffer);
 	}
@@ -615,6 +728,11 @@ void GpuPathTracer::Render(const Scene& scene, const PreparedScene& prepared, co
 	frameData.SkyBottomColor = glm::vec4(scene.Sky.BottomColor, scene.Sky.Intensity);
 	frameData.SkyTopColor = glm::vec4(scene.Sky.TopColor, 0.0f);
 	frameData.SkyMode = (int32_t)scene.Sky.Mode;
+	frameData.EnvironmentParams = glm::vec4(prepared.EnvironmentRotation, prepared.EnvironmentProbability, 0.0f, 0.0f);
+	if (scene.Sky.HasEnvironmentMap())
+		frameData.EnvironmentSize = glm::uvec4(scene.Sky.Environment->GetWidth(), scene.Sky.Environment->GetHeight(), 0u, 0u);
+	// Also when the map isn't selected, so switching sky modes back and forth doesn't re-upload it
+	UploadEnvironment(scene.Sky);
 	Upload(m_FrameBuffer, Binding::Frame, BindingTypes[Binding::Frame], &frameData, sizeof(frameData));
 
 	std::vector<SphereGPU> spheres(scene.Spheres.size());

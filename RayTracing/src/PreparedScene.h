@@ -40,6 +40,14 @@ struct PreparedScene {
 	std::vector<int> SphereLights;          // per sphere: index into Lights, or -1
 	std::vector<int> InstanceLightOffsets;  // per mesh instance: Lights index of its first triangle, or -1
 
+	// The environment map, when the sky has one worth sampling
+	const EnvironmentMap* Environment = nullptr;
+	float EnvironmentRotation = 0.0f;    // turns
+	float EnvironmentIntensity = 1.0f;
+	float EnvironmentProbability = 0.0f; // chance light sampling picks the environment rather than Lights
+
+	bool HasLights() const { return !Lights.empty() || EnvironmentProbability > 0.0f; }
+
 	void Prepare(const Scene& scene);
 
 	// Light picked by a uniform random number u (Lights must not be empty)

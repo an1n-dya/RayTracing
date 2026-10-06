@@ -1,9 +1,24 @@
 #include "Scene.h"
 
+#include "EnvironmentSampling.h"
+
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <atomic>
 #include <cfloat>
+
+glm::vec3 SkySettings::GetRadiance(const glm::vec3& direction) const {
+	switch (Mode) {
+	case SkyMode::Gradient:
+		return glm::mix(BottomColor, TopColor, 0.5f * (direction.y + 1.0f)) * Intensity;
+	case SkyMode::EnvironmentMap:
+		if (!Environment)
+			return glm::vec3(0.0f);
+		return EnvironmentSampling::Lookup(*Environment, direction, EnvironmentRotation / 360.0f) * Intensity;
+	default:
+		return glm::vec3(0.0f);
+	}
+}
 
 glm::mat4 ObjectTransform::GetMatrix() const {
 	glm::mat4 matrix = glm::translate(glm::mat4(1.0f), Translation);

@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "camera": {
+    "position": [0, 1.6, 4.6],
+    "direction": [0, -0.28, -1],
+    "verticalFov": 45,
+    "aperture": 0,
+    "focusDistance": 4.6,
+    "moveSpeed": 3
+  },
+  "sky": {
+    "mode": "environment",
+    "environment": "builtin:sun-sky",
+    "rotation": 0,
+    "intensity": 0.5
+  },
+  "materials": [
+    { "name": "Floor", "albedo": [0.8, 0.8, 0.8], "roughness": 0.6 },
+    { "name": "Gold", "albedo": [1, 0.76, 0.33], "roughness": 0.2, "metallic": 1 },
+    { "name": "Glass", "albedo": [0.9, 0.95, 1], "roughness": 0, "transmission": 1, "ior": 1.5 },
+    { "name": "Red Plastic", "albedo": [0.8, 0.1, 0.08], "roughness": 0.3 }
+  ],
+  "planes": [
+    { "point": [0, 0, 0], "normal": [0, 1, 0], "material": 0 }
+  ],
+  "meshes": [
+    { "name": "Torus Knot", "source": "models/TorusKnot.obj" },
+    { "name": "Sphere Mesh", "source": "builtin:sphere" },
+    { "name": "Box", "source": "builtin:box" }
+  ],
+  "meshInstances": [
+    { "mesh": 0, "position": [0, 0.45, 0], "rotation": [0, 20, 0], "scale": [1, 1, 1], "material": 1 },
+    { "mesh": 1, "position": [-1.6, 0.5, 0.6], "rotation": [0, 0, 0], "scale": [1, 1, 1], "material": 2 },
+    { "mesh": 2, "position": [1.6, 0.35, 0.5], "rotation": [0, 30, 0], "scale": [0.7, 0.7, 0.7], "material": 3 }
+  ]
+}

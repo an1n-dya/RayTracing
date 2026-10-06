@@ -26,30 +26,44 @@ namespace SceneSerializer {
 
 	static const char* SkyModeToString(SkyMode mode) {
 		switch (mode) {
-		case SkyMode::Gradient: return "gradient";
-		default:                return "none";
+		case SkyMode::Gradient:       return "gradient";
+		case SkyMode::EnvironmentMap: return "environment";
+		default:                      return "none";
 		}
 	}
 
 	static SkyMode SkyModeFromString(const std::string& mode) {
 		if (mode == "gradient")
 			return SkyMode::Gradient;
+		if (mode == "environment")
+			return SkyMode::EnvironmentMap;
 		return SkyMode::None;
 	}
 
-	// Mesh files are stored relative to the scene file when possible, so scene folders can be moved around
+	static bool IsBuiltin(const std::string& source) {
+		return source.rfind("builtin:", 0) == 0;
+	}
+
+	// Mesh and image files near the scene file (at most two folders up) are stored relative to it, so scene folders
+	// can be moved around; anything further away keeps its absolute path
 	static std::string MakeRelative(const std::string& source, const std::filesystem::path& sceneDirectory) {
-		if (BuiltinMeshes::IsBuiltin(source))
+		if (IsBuiltin(source))
 			return source;
 		std::error_code ec;
 		std::filesystem::path relative = std::filesystem::relative(source, sceneDirectory, ec);
 		if (ec || relative.empty())
 			return source;
+
+		int levelsUp = 0;
+		for (const std::filesystem::path& part : relative)
+			levelsUp += part == "..";
+		if (levelsUp > 2)
+			return std::filesystem::absolute(source).generic_string();
 		return relative.generic_string();
 	}
 
 	static std::string Resolve(const std::string& source, const std::filesystem::path& sceneDirectory) {
-		if (BuiltinMeshes::IsBuiltin(source) || std::filesystem::path(source).is_absolute())
+		if (IsBuiltin(source) || std::filesystem::path(source).is_absolute())
 			return source;
 		return (sceneDirectory / source).lexically_normal().string();
 	}
@@ -73,6 +87,9 @@ namespace SceneSerializer {
 		sky["topColor"] = ToJson(scene.Sky.TopColor);
 		sky["bottomColor"] = ToJson(scene.Sky.BottomColor);
 		sky["intensity"] = scene.Sky.Intensity;
+		if (scene.Sky.Environment)
+			sky["environment"] = MakeRelative(scene.Sky.Environment->GetSource(), sceneDirectory);
+		sky["rotation"] = scene.Sky.EnvironmentRotation;
 
 		Json::Value& materials = root["materials"] = Json::Value::MakeArray();
 		for (const Material& material : scene.Materials) {
@@ -146,6 +163,18 @@ namespace SceneSerializer {
 		loaded.Sky.TopColor = ReadVec3(sky["topColor"], loaded.Sky.TopColor);
 		loaded.Sky.BottomColor = ReadVec3(sky["bottomColor"], loaded.Sky.BottomColor);
 		loaded.Sky.Intensity = sky["intensity"].AsFloat(loaded.Sky.Intensity);
+		loaded.Sky.EnvironmentRotation = sky["rotation"].AsFloat(loaded.Sky.EnvironmentRotation);
+
+		std::filesystem::path sceneDirectory = std::filesystem::absolute(path).parent_path();
+		if (sky["environment"].IsString()) {
+			std::string environmentError;
+			loaded.Sky.Environment = EnvironmentMap::Load(Resolve(sky["environment"].AsString(), sceneDirectory), &environmentError);
+			if (!loaded.Sky.Environment) {
+				if (error)
+					*error = path + ": " + environmentError;
+				return false;
+			}
+		}
 
 		for (const Json::Value& json : root["materials"].Elements()) {
 			Material material;
@@ -180,7 +209,6 @@ namespace SceneSerializer {
 			loaded.Planes.push_back(plane);
 		}
 
-		std::filesystem::path sceneDirectory = std::filesystem::absolute(path).parent_path();
 		for (const Json::Value& json : root["meshes"].Elements()) {
 			Mesh mesh;
 			std::string meshError;

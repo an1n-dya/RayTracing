@@ -1,10 +1,12 @@
 #pragma once
 
+#include "EnvironmentMap.h"
 #include "Mesh.h"
 
 #include "glm/glm.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -52,8 +54,9 @@ struct MeshInstance {
 };
 
 enum class SkyMode : int {
-	None = 0,     // black: the scene is lit only by emissive materials
-	Gradient = 1, // vertical gradient between BottomColor (straight down) and TopColor (straight up)
+	None = 0,           // black: the scene is lit only by emissive materials
+	Gradient = 1,       // vertical gradient between BottomColor (straight down) and TopColor (straight up)
+	EnvironmentMap = 2, // HDR environment image, importance sampled by light sampling
 };
 
 struct SkySettings {
@@ -62,12 +65,12 @@ struct SkySettings {
 	glm::vec3 TopColor{ 0.5f, 0.7f, 1.0f };
 	float Intensity = 1.0f;
 
-	glm::vec3 GetRadiance(const glm::vec3& direction) const {
-		if (Mode == SkyMode::None)
-			return glm::vec3(0.0f);
-		float t = 0.5f * (direction.y + 1.0f);
-		return glm::mix(BottomColor, TopColor, t) * Intensity;
-	}
+	// SkyMode::EnvironmentMap
+	std::shared_ptr<EnvironmentMap> Environment; // loaded from Environment->GetSource()
+	float EnvironmentRotation = 0.0f;            // degrees around +Y
+
+	bool HasEnvironmentMap() const { return Mode == SkyMode::EnvironmentMap && Environment != nullptr; }
+	glm::vec3 GetRadiance(const glm::vec3& direction) const;
 };
 
 // Identifies one object in a Scene (e.g. the editor's selection, or what a ray hit)

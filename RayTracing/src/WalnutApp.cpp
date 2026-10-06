@@ -434,6 +434,18 @@ private:
 		return label;
 	}
 
+	void LoadEnvironment(const std::string& source) {
+		std::string error;
+		std::shared_ptr<EnvironmentMap> environment = EnvironmentMap::Load(source, &error);
+		if (!environment) {
+			ShowError("Couldn't load environment map:\n" + error);
+			return;
+		}
+		m_Scene.Sky.Environment = environment;
+		m_Scene.Sky.Mode = SkyMode::EnvironmentMap;
+		m_SceneChanged = true;
+	}
+
 	// Adds an instance of the mesh with this source, loading it first unless the scene already has it
 	void AddMeshInstance(const std::string& source) {
 		int meshIndex = m_Scene.FindMesh(source);
@@ -617,15 +629,33 @@ private:
 		ImGui::Begin("Environment");
 
 		SkySettings& sky = m_Scene.Sky;
-		const char* skyModes[] = { "None", "Gradient" };
+		const char* skyModes[] = { "None", "Gradient", "Environment Map" };
 		int skyMode = (int)sky.Mode;
 		if (ImGui::Combo("Sky", &skyMode, skyModes, IM_ARRAYSIZE(skyModes))) {
 			sky.Mode = (SkyMode)skyMode;
+			// Start with something visible rather than black
+			if (sky.Mode == SkyMode::EnvironmentMap && !sky.Environment)
+				LoadEnvironment(EnvironmentMap::BuiltinSunSky);
 			m_SceneChanged = true;
 		}
 		if (sky.Mode == SkyMode::Gradient) {
 			m_SceneChanged |= ImGui::ColorEdit3("Top Color", glm::value_ptr(sky.TopColor));
 			m_SceneChanged |= ImGui::ColorEdit3("Bottom Color", glm::value_ptr(sky.BottomColor));
+		}
+		if (sky.Mode == SkyMode::EnvironmentMap) {
+			if (sky.Environment) {
+				ImGui::TextWrapped("%s", sky.Environment->GetSource().c_str());
+				ImGui::TextDisabled("%u x %u", sky.Environment->GetWidth(), sky.Environment->GetHeight());
+			}
+			if (ImGui::Button("Load HDR...")) {
+				std::string path = FileDialogs::OpenFile("HDR image (*.hdr)\0*.hdr\0Images (*.hdr;*.png;*.jpg)\0*.hdr;*.png;*.jpg;*.jpeg\0All files\0*.*\0");
+				if (!path.empty())
+					LoadEnvironment(path);
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Built-in Sun & Sky"))
+				LoadEnvironment(EnvironmentMap::BuiltinSunSky);
+			m_SceneChanged |= ImGui::SliderFloat("Rotation", &sky.EnvironmentRotation, -180.0f, 180.0f, "%.1f deg");
 		}
 		if (sky.Mode != SkyMode::None)
 			m_SceneChanged |= ImGui::DragFloat("Intensity", &sky.Intensity, 0.01f, 0.0f, 100.0f);
