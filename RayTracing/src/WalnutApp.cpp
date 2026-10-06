@@ -76,6 +76,17 @@ public:
 		if (ImGui::Button("Reset"))
 			m_Renderer.ResetFrameIndex();
 
+		if (ImGui::CollapsingHeader("Path Tracing", ImGuiTreeNodeFlags_DefaultOpen)) {
+			Renderer::Settings& settings = m_Renderer.GetSettings();
+			bool changed = false;
+			changed |= ImGui::SliderInt("Max Bounces", &settings.MaxBounces, 1, 64);
+			changed |= ImGui::Checkbox("Russian Roulette", &settings.RussianRoulette);
+			if (settings.RussianRoulette)
+				changed |= ImGui::SliderInt("RR Start Bounce", &settings.RussianRouletteStartBounce, 0, 16);
+			if (changed)
+				m_Renderer.ResetFrameIndex();
+		}
+
 		if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
 			float verticalFOV = m_Camera.GetVerticalFOV();
 			if (ImGui::SliderFloat("Vertical FOV", &verticalFOV, 10.0f, 120.0f, "%.1f deg")) {

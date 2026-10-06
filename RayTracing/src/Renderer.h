@@ -5,6 +5,7 @@
 #include "Camera.h"
 #include "GpuPathTracer.h"
 #include "Ray.h"
+#include "RenderSettings.h"
 #include "Scene.h"
 
 #include <memory>
@@ -12,11 +13,7 @@
 
 class Renderer {
 public:
-	struct Settings {
-		bool Accumulate = true;
-		bool SlowRandom = false;
-		bool UseGPU = false;
-	};
+	using Settings = RenderSettings;
 public:
 	Renderer() = default;
 
@@ -39,6 +36,10 @@ private:
 	};
 
 	glm::vec4 PerPixel(uint32_t x, uint32_t y); // RayGen
+
+	// Dispatch to the fast PCG hash or Walnut::Random depending on Settings.SlowRandom
+	float RandomFloat(uint32_t& seed) const;
+	glm::vec3 RandomInUnitSphere(uint32_t& seed) const;
 
 	HitPayload TraceRay(const Ray& ray);
 	HitPayload ClosestHit(const Ray& ray, float hitDistance, int objectIndex);

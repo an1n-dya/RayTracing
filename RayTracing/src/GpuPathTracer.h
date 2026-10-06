@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Camera.h"
+#include "RenderSettings.h"
 #include "Scene.h"
 
 #include <vulkan/vulkan.h>
@@ -20,7 +21,7 @@ public:
 	GpuPathTracer& operator=(const GpuPathTracer&) = delete;
 
 	void OnResize(uint32_t width, uint32_t height);
-	void Render(const Scene& scene, const Camera& camera, uint32_t frameIndex);
+	void Render(const Scene& scene, const Camera& camera, uint32_t frameIndex, const RenderSettings& settings);
 
 	VkDescriptorSet GetDescriptorSet() const { return m_DisplayDescriptorSet; }
 	uint32_t GetWidth() const { return m_Width; }
@@ -34,7 +35,6 @@ private:
 private:
 	static constexpr uint32_t MaxSpheres = 64;
 	static constexpr uint32_t MaxMaterials = 64;
-	static constexpr uint32_t Bounces = 5;
 
 	bool m_Initialized = false;
 

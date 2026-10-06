@@ -44,6 +44,8 @@ layout(push_constant) uniform PushConstants {
 	uint FrameIndex;
 	uint SphereCount;
 	uint Bounces;
+	uint RussianRoulette;
+	uint RussianRouletteStartBounce;
 } u_PC;
 
 // -- RNG: same PCG hash as Utils::PCG_Hash / RandomFloat / InUnitSphere in Renderer.cpp --
@@ -186,6 +188,15 @@ vec3 PerPixel(uvec2 pixelCoord)
 
 		rayOrigin = payload.WorldPosition + payload.WorldNormal * 0.0001;
 		rayDirection = normalize(payload.WorldNormal + RandomInUnitSphere(seed));
+
+		// Russian roulette (same as Renderer::PerPixel)
+		if (u_PC.RussianRoulette != 0u && i >= u_PC.RussianRouletteStartBounce)
+		{
+			float p = clamp(max(contribution.r, max(contribution.g, contribution.b)), 0.05, 1.0);
+			if (RandomFloat(seed) > p)
+				break;
+			contribution /= p;
+		}
 	}
 
 	return light;

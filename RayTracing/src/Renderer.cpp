@@ -68,7 +68,7 @@ void Renderer::Render(const Scene& scene, const Camera& camera) {
 	m_ActiveCamera = &camera;
 
 	if (m_Settings.UseGPU) {
-		m_GpuPathTracer.Render(scene, camera, m_FrameIndex);
+		m_GpuPathTracer.Render(scene, camera, m_FrameIndex, m_Settings);
 	}
 	else {
 		if (m_FrameIndex == 1)
@@ -125,8 +125,7 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y) {
 	uint32_t seed = x + y * m_FinalImage->GetWidth();
 	seed *= m_FrameIndex;
 
-	int bounces = 5;
-	for (int i = 0; i < bounces; i++) {
+	for (int i = 0; i < m_Settings.MaxBounces; i++) {
 		seed += i;
 
 		Renderer::HitPayload payload = TraceRay(ray);
@@ -145,13 +144,31 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y) {
 		ray.Origin = payload.WorldPosition + payload.WorldNormal * 0.0001f;
 		//ray.Direction = glm::reflect(ray.Direction,
 		//	payload.WorldNormal + material.Roughness * Walnut::Random::Vec3(-0.5f, 0.5f));
-		if (m_Settings.SlowRandom)
-			ray.Direction = glm::normalize(payload.WorldNormal + Walnut::Random::InUnitSphere());
-		else
-			ray.Direction = glm::normalize(payload.WorldNormal + Utils::InUnitSphere(seed));
+		ray.Direction = glm::normalize(payload.WorldNormal + RandomInUnitSphere(seed));
+
+		// Russian roulette: randomly end paths that can't carry much more light, boosting the
+		// survivors by 1/p so the estimate stays unbiased.
+		if (m_Settings.RussianRoulette && i >= m_Settings.RussianRouletteStartBounce) {
+			float p = glm::clamp(glm::max(contribution.r, glm::max(contribution.g, contribution.b)), 0.05f, 1.0f);
+			if (RandomFloat(seed) > p)
+				break;
+			contribution /= p;
+		}
 	}
 
 	return glm::vec4(light, 1.0f);
+}
+
+float Renderer::RandomFloat(uint32_t& seed) const {
+	if (m_Settings.SlowRandom)
+		return Walnut::Random::Float();
+	return Utils::RandomFloat(seed);
+}
+
+glm::vec3 Renderer::RandomInUnitSphere(uint32_t& seed) const {
+	if (m_Settings.SlowRandom)
+		return Walnut::Random::InUnitSphere();
+	return Utils::InUnitSphere(seed);
 }
 
 Renderer::HitPayload Renderer::TraceRay(const Ray& ray) {
