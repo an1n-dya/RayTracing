@@ -68,9 +68,8 @@ layout(std430, binding = 5) readonly buffer PlaneBuffer {
 struct MeshInstance {
 	mat4 ObjectToWorld;
 	mat4 WorldToObject;
-	vec4 BoundsMin; // object space
-	vec4 BoundsMax;
 	uvec4 Info;     // x = first triangle (in Indices / 3), y = triangle count, z = material index, w = first light (~0u if none)
+	uvec4 Info2;    // x = first BVH node, y = node count (0 = empty mesh)
 };
 
 layout(std430, binding = 6) readonly buffer InstanceBuffer {
@@ -89,6 +88,18 @@ layout(std430, binding = 7) readonly buffer VertexBuffer {
 
 layout(std430, binding = 8) readonly buffer IndexBuffer {
 	uint Indices[];
+};
+
+// Per-mesh BVHs (BVH.h), concatenated. Child links and leaf triangle ranges are relative to the mesh.
+struct BVHNode {
+	vec3 BoundsMin;
+	uint LeftOrFirst;   // interior: left child (right = left + 1); leaf: first triangle
+	vec3 BoundsMax;
+	uint TriangleCount; // 0 for interior nodes
+};
+
+layout(std430, binding = 15) readonly buffer BVHBuffer {
+	BVHNode Nodes[];
 };
 
 // PreparedScene::Lights: emissive spheres and the triangles of emissive mesh instances
@@ -312,31 +323,72 @@ HitPayload TraceRay(vec3 rayOrigin, vec3 rayDirection)
 
 	for (uint i = 0u; i < u_PC.InstanceCount; i++)
 	{
+		if (Instances[i].Info2.y == 0u)
+			continue;
+
 		// Object space; the direction isn't renormalized, so distances stay comparable with world space
 		vec3 origin = vec3(Instances[i].WorldToObject * vec4(rayOrigin, 1.0));
 		vec3 direction = mat3(Instances[i].WorldToObject) * rayDirection;
+		vec3 inverseDirection = 1.0 / direction;
+		uint firstNode = Instances[i].Info2.x;
+		uint firstTriangle = Instances[i].Info.x;
 
 		const vec3 padding = vec3(1e-4); // flat meshes (quads) have zero-thickness bounds
-		if (IntersectAABB(origin, 1.0 / direction, Instances[i].BoundsMin.xyz - padding, Instances[i].BoundsMax.xyz + padding, hitDistance) < 0.0)
+		if (IntersectAABB(origin, inverseDirection, Nodes[firstNode].BoundsMin - padding, Nodes[firstNode].BoundsMax + padding, hitDistance) < 0.0)
 			continue;
 
-		uint firstTriangle = Instances[i].Info.x;
-		uint triangleCount = Instances[i].Info.y;
-		for (uint triangle = firstTriangle; triangle < firstTriangle + triangleCount; triangle++)
+		// Stack-based BVH traversal, nearer child first (same as Renderer::TraceRay)
+		uint stack[64];
+		uint stackSize = 0u;
+		uint nodeIndex = 0u;
+		while (true)
 		{
-			vec3 v0 = Vertices[Indices[triangle * 3u + 0u]].Position.xyz;
-			vec3 v1 = Vertices[Indices[triangle * 3u + 1u]].Position.xyz;
-			vec3 v2 = Vertices[Indices[triangle * 3u + 2u]].Position.xyz;
-			vec2 barycentrics;
-			float t = IntersectTriangle(origin, direction, v0, v1, v2, barycentrics);
-			if (t > 0.0 && t < hitDistance)
+			BVHNode node = Nodes[firstNode + nodeIndex];
+			if (node.TriangleCount > 0u)
 			{
-				hitDistance = t;
-				hitType = OBJECT_MESH_INSTANCE;
-				hitIndex = int(i);
-				hitTriangle = triangle;
-				hitBarycentrics = barycentrics;
+				for (uint local = node.LeftOrFirst; local < node.LeftOrFirst + node.TriangleCount; local++)
+				{
+					uint triangle = firstTriangle + local;
+					vec3 v0 = Vertices[Indices[triangle * 3u + 0u]].Position.xyz;
+					vec3 v1 = Vertices[Indices[triangle * 3u + 1u]].Position.xyz;
+					vec3 v2 = Vertices[Indices[triangle * 3u + 2u]].Position.xyz;
+					vec2 barycentrics;
+					float t = IntersectTriangle(origin, direction, v0, v1, v2, barycentrics);
+					if (t > 0.0 && t < hitDistance)
+					{
+						hitDistance = t;
+						hitType = OBJECT_MESH_INSTANCE;
+						hitIndex = int(i);
+						hitTriangle = triangle;
+						hitBarycentrics = barycentrics;
+					}
+				}
+				if (stackSize == 0u)
+					break;
+				nodeIndex = stack[--stackSize];
+				continue;
 			}
+
+			uint nearChild = node.LeftOrFirst, farChild = node.LeftOrFirst + 1u;
+			BVHNode nearNode = Nodes[firstNode + nearChild], farNode = Nodes[firstNode + farChild];
+			float nearDistance = IntersectAABB(origin, inverseDirection, nearNode.BoundsMin - padding, nearNode.BoundsMax + padding, hitDistance);
+			float farDistance = IntersectAABB(origin, inverseDirection, farNode.BoundsMin - padding, farNode.BoundsMax + padding, hitDistance);
+			if (nearDistance < 0.0 || (farDistance >= 0.0 && farDistance < nearDistance))
+			{
+				uint swapChild = nearChild; nearChild = farChild; farChild = swapChild;
+				float swapDistance = nearDistance; nearDistance = farDistance; farDistance = swapDistance;
+			}
+
+			if (nearDistance < 0.0)
+			{
+				if (stackSize == 0u)
+					break;
+				nodeIndex = stack[--stackSize];
+				continue;
+			}
+			nodeIndex = nearChild;
+			if (farDistance >= 0.0)
+				stack[stackSize++] = farChild;
 		}
 	}
 

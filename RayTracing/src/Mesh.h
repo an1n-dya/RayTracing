@@ -1,5 +1,7 @@
 #pragma once
 
+#include "BVH.h"
+
 #include <glm/glm.hpp>
 
 #include <cstdint>
@@ -16,8 +18,9 @@ struct Mesh {
 	std::string Name;
 	std::string Source; // "builtin:<name>" or the file it was loaded from - what scene files store
 	std::vector<Vertex> Vertices;
-	std::vector<uint32_t> Indices; // three per triangle, counter-clockwise when seen from the front
+	std::vector<uint32_t> Indices; // three per triangle, counter-clockwise when seen from the front, in BVH order
 	glm::vec3 BoundsMin{ 0.0f }, BoundsMax{ 0.0f };
+	std::vector<BVHNode> BVHNodes; // built by MeshLoader::Load (BVH::Build); node 0 is the root
 
 	uint32_t GetTriangleCount() const { return (uint32_t)(Indices.size() / 3); }
 	void ComputeBounds();

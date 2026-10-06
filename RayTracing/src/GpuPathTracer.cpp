@@ -32,6 +32,7 @@ namespace {
 			EnvironmentMarginal = 12,    // SSBO: its sampling tables
 			EnvironmentConditional = 13,
 			EnvironmentPdf = 14,
+			BVHNodes = 15,         // SSBO: all meshes' BVH nodes
 			Count
 		};
 	}
@@ -42,6 +43,7 @@ namespace {
 		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 		VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
 		VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -84,10 +86,11 @@ namespace {
 	struct InstanceGPU {
 		glm::mat4 ObjectToWorld;
 		glm::mat4 WorldToObject;
-		glm::vec4 BoundsMin; // object space
-		glm::vec4 BoundsMax;
 		glm::uvec4 Info;     // x = first triangle, y = triangle count, z = material index, w = first light (~0u if none)
+		glm::uvec4 Info2;    // x = first BVH node
 	};
+
+	static_assert(sizeof(BVHNode) == 32, "BVHNode must match the shader's layout");
 
 	struct VertexGPU {
 		glm::vec4 Position;
@@ -294,7 +297,7 @@ GpuPathTracer::~GpuPathTracer()
 		ReleaseImages();
 
 	std::vector<Buffer> buffers = { m_FrameBuffer, m_SphereBuffer, m_MaterialBuffer, m_PlaneBuffer, m_InstanceBuffer,
-		m_VertexBuffer, m_IndexBuffer, m_LightBuffer, m_LightCDFBuffer, m_EnvironmentTexelBuffer, m_EnvironmentMarginalBuffer,
+		m_VertexBuffer, m_IndexBuffer, m_BVHBuffer, m_LightBuffer, m_LightCDFBuffer, m_EnvironmentTexelBuffer, m_EnvironmentMarginalBuffer,
 		m_EnvironmentConditionalBuffer, m_EnvironmentPdfBuffer };
 
 	Walnut::Application::SubmitResourceFree([shaderModule = m_ShaderModule, pipeline = m_Pipeline,
@@ -405,11 +408,16 @@ void GpuPathTracer::UploadGeometry(const Scene& scene)
 
 	std::vector<VertexGPU> vertices;
 	std::vector<uint32_t> indices;
+	std::vector<BVHNode> nodes;
 	m_MeshFirstTriangle.clear();
+	m_MeshFirstNode.clear();
 	for (const Mesh& mesh : scene.Meshes)
 	{
 		uint32_t vertexOffset = (uint32_t)vertices.size();
 		m_MeshFirstTriangle.push_back((uint32_t)(indices.size() / 3));
+		m_MeshFirstNode.push_back((uint32_t)nodes.size());
+		// Node links and leaf ranges stay relative to the mesh; the shader adds the instance's offsets
+		nodes.insert(nodes.end(), mesh.BVHNodes.begin(), mesh.BVHNodes.end());
 
 		for (const Vertex& vertex : mesh.Vertices)
 			vertices.push_back({ glm::vec4(vertex.Position, 1.0f), glm::vec4(vertex.Normal, 0.0f) });
@@ -419,6 +427,7 @@ void GpuPathTracer::UploadGeometry(const Scene& scene)
 
 	UploadStatic(m_VertexBuffer, Binding::Vertices, vertices.data(), vertices.size() * sizeof(VertexGPU));
 	UploadStatic(m_IndexBuffer, Binding::Indices, indices.data(), indices.size() * sizeof(uint32_t));
+	UploadStatic(m_BVHBuffer, Binding::BVHNodes, nodes.data(), nodes.size() * sizeof(BVHNode));
 
 	m_GeometryUploaded = true;
 	m_UploadedGeometryVersion = scene.GeometryVersion;
@@ -771,10 +780,9 @@ void GpuPathTracer::Render(const Scene& scene, const PreparedScene& prepared, co
 		const Mesh& mesh = scene.Meshes[instance.MeshIndex];
 		instances[i].ObjectToWorld = prepared.Instances[i].ObjectToWorld;
 		instances[i].WorldToObject = prepared.Instances[i].WorldToObject;
-		instances[i].BoundsMin = glm::vec4(mesh.BoundsMin, 0.0f);
-		instances[i].BoundsMax = glm::vec4(mesh.BoundsMax, 0.0f);
 		instances[i].Info = glm::uvec4(m_MeshFirstTriangle[instance.MeshIndex], mesh.GetTriangleCount(), (uint32_t)instance.MaterialIndex,
 			(uint32_t)prepared.InstanceLightOffsets[i]); // -1 becomes ~0u
+		instances[i].Info2 = glm::uvec4(m_MeshFirstNode[instance.MeshIndex], (uint32_t)mesh.BVHNodes.size(), 0u, 0u);
 	}
 	Upload(m_InstanceBuffer, Binding::Instances, BindingTypes[Binding::Instances], instances.data(), instances.size() * sizeof(InstanceGPU));
 

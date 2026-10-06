@@ -93,9 +93,11 @@ private:
 	// Mesh geometry, only re-uploaded when Scene::GeometryVersion changes
 	Buffer m_VertexBuffer;
 	Buffer m_IndexBuffer;
+	Buffer m_BVHBuffer;
 	bool m_GeometryUploaded = false;
 	uint64_t m_UploadedGeometryVersion = 0;
 	std::vector<uint32_t> m_MeshFirstTriangle; // per mesh, into the concatenated index buffer
+	std::vector<uint32_t> m_MeshFirstNode;     // per mesh, into the concatenated BVH node buffer
 
 	// Environment map + sampling tables, only re-uploaded when the map changes
 	Buffer m_EnvironmentTexelBuffer;

@@ -361,26 +361,66 @@ Renderer::HitPayload Renderer::TraceRay(const Ray& ray) {
 		const Mesh& mesh = scene.Meshes[scene.MeshInstances[i].MeshIndex];
 		const PreparedScene::Instance& instance = m_Prepared.Instances[i];
 
+		const std::vector<BVHNode>& nodes = mesh.BVHNodes;
+		if (nodes.empty())
+			continue;
+
 		// Intersect in object space. The direction isn't renormalized, so distances stay comparable with world space.
 		glm::vec3 origin = glm::vec3(instance.WorldToObject * glm::vec4(ray.Origin, 1.0f));
 		glm::vec3 direction = glm::mat3(instance.WorldToObject) * ray.Direction;
+		glm::vec3 inverseDirection = 1.0f / direction;
 
+		// Distance to a node's box, or -1 if the ray misses it (or only hits it beyond the closest hit so far)
 		const glm::vec3 padding(1e-4f); // flat meshes (quads) have zero-thickness bounds
-		if (Intersect::AABB(origin, 1.0f / direction, mesh.BoundsMin - padding, mesh.BoundsMax + padding, hitDistance) < 0.0f)
+		auto nodeDistance = [&](uint32_t nodeIndex) {
+			return Intersect::AABB(origin, inverseDirection, nodes[nodeIndex].BoundsMin - padding, nodes[nodeIndex].BoundsMax + padding, hitDistance);
+		};
+
+		if (nodeDistance(0) < 0.0f)
 			continue;
 
-		for (uint32_t triangle = 0; triangle < mesh.GetTriangleCount(); triangle++) {
-			const glm::vec3& v0 = mesh.Vertices[mesh.Indices[triangle * 3 + 0]].Position;
-			const glm::vec3& v1 = mesh.Vertices[mesh.Indices[triangle * 3 + 1]].Position;
-			const glm::vec3& v2 = mesh.Vertices[mesh.Indices[triangle * 3 + 2]].Position;
-			glm::vec2 barycentrics;
-			float t = Intersect::Triangle(origin, direction, v0, v1, v2, barycentrics);
-			if (t > 0.0f && t < hitDistance) {
-				hitDistance = t;
-				hitObject = { ObjectType::MeshInstance, (int)i };
-				hitTriangle = triangle;
-				hitBarycentrics = barycentrics;
+		// Stack-based BVH traversal, nearer child first
+		uint32_t stack[64];
+		uint32_t stackSize = 0;
+		uint32_t nodeIndex = 0;
+		while (true) {
+			const BVHNode& node = nodes[nodeIndex];
+			if (node.IsLeaf()) {
+				for (uint32_t triangle = node.LeftOrFirst; triangle < node.LeftOrFirst + node.TriangleCount; triangle++) {
+					const glm::vec3& v0 = mesh.Vertices[mesh.Indices[triangle * 3 + 0]].Position;
+					const glm::vec3& v1 = mesh.Vertices[mesh.Indices[triangle * 3 + 1]].Position;
+					const glm::vec3& v2 = mesh.Vertices[mesh.Indices[triangle * 3 + 2]].Position;
+					glm::vec2 barycentrics;
+					float t = Intersect::Triangle(origin, direction, v0, v1, v2, barycentrics);
+					if (t > 0.0f && t < hitDistance) {
+						hitDistance = t;
+						hitObject = { ObjectType::MeshInstance, (int)i };
+						hitTriangle = triangle;
+						hitBarycentrics = barycentrics;
+					}
+				}
+				if (stackSize == 0)
+					break;
+				nodeIndex = stack[--stackSize];
+				continue;
 			}
+
+			uint32_t nearChild = node.LeftOrFirst, farChild = node.LeftOrFirst + 1;
+			float nearDistance = nodeDistance(nearChild), farDistance = nodeDistance(farChild);
+			if (nearDistance < 0.0f || (farDistance >= 0.0f && farDistance < nearDistance)) {
+				std::swap(nearChild, farChild);
+				std::swap(nearDistance, farDistance);
+			}
+
+			if (nearDistance < 0.0f) {
+				if (stackSize == 0)
+					break;
+				nodeIndex = stack[--stackSize];
+				continue;
+			}
+			nodeIndex = nearChild;
+			if (farDistance >= 0.0f)
+				stack[stackSize++] = farChild;
 		}
 	}
 

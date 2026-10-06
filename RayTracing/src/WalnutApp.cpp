@@ -538,7 +538,7 @@ private:
 			else if (m_Selection.Type == ObjectType::MeshInstance) {
 				MeshInstance& instance = m_Scene.MeshInstances[m_Selection.Index];
 				const Mesh& mesh = m_Scene.Meshes[instance.MeshIndex];
-				ImGui::TextDisabled("%s: %u triangles", mesh.Source.c_str(), mesh.GetTriangleCount());
+				ImGui::TextDisabled("%s: %u triangles, %zu BVH nodes", mesh.Source.c_str(), mesh.GetTriangleCount(), mesh.BVHNodes.size());
 				m_SceneChanged |= ImGui::DragFloat3("Position", glm::value_ptr(instance.Transform.Translation), 0.05f);
 				m_SceneChanged |= ImGui::DragFloat3("Rotation", glm::value_ptr(instance.Transform.Rotation), 0.5f, -360.0f, 360.0f, "%.1f deg");
 				m_SceneChanged |= ImGui::DragFloat3("Scale", glm::value_ptr(instance.Transform.Scale), 0.01f, 0.001f, 1000.0f);

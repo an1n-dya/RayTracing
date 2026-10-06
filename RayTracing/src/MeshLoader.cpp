@@ -147,8 +147,10 @@ namespace MeshLoader {
 
 	bool Load(const std::string& source, Mesh& mesh, std::string* error) {
 		if (BuiltinMeshes::IsBuiltin(source)) {
-			if (BuiltinMeshes::Create(source, mesh))
+			if (BuiltinMeshes::Create(source, mesh)) {
+				BVH::Build(mesh);
 				return true;
+			}
 			if (error)
 				*error = "unknown built-in mesh " + source;
 			return false;
@@ -170,6 +172,7 @@ namespace MeshLoader {
 			return false;
 		}
 
+		BVH::Build(loaded);
 		mesh = std::move(loaded);
 		return true;
 	}
