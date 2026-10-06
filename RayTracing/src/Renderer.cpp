@@ -1,10 +1,12 @@
 #include "Renderer.h"
 
+#include "ImageExport.h"
 #include "ToneMapping.h"
 
 #include "Walnut/Random.h"
 
 #include <execution>
+#include <filesystem>
 
 namespace Utils {
 	static uint32_t ConvertToRGBA(const glm::vec4& color) {
@@ -260,6 +262,42 @@ Renderer::HitPayload Renderer::Miss(const Ray& ray) {
 	Renderer::HitPayload payload;
 	payload.HitDistance = -0.1f;
 	return payload;
+}
+
+bool Renderer::SaveImage(const std::string& path) {
+	uint32_t width = GetFinalImageWidth();
+	uint32_t height = GetFinalImageHeight();
+	if (width == 0 || height == 0)
+		return false;
+	size_t pixelCount = (size_t)width * height;
+
+	std::string extension = std::filesystem::path(path).extension().string();
+	for (char& c : extension)
+		c = (char)tolower(c);
+
+	if (extension == ".hdr") {
+		std::vector<glm::vec4> accumulation;
+		if (m_Settings.UseGPU)
+			m_GpuPathTracer.ReadAccumulationImage(accumulation);
+		else
+			accumulation.assign(m_AccumulationData, m_AccumulationData + pixelCount);
+
+		std::vector<float> rgb(pixelCount * 3);
+		for (size_t i = 0; i < pixelCount; i++) {
+			glm::vec3 average = accumulation[i].a > 0.0f ? glm::vec3(accumulation[i]) / accumulation[i].a : glm::vec3(0.0f);
+			rgb[i * 3 + 0] = average.r;
+			rgb[i * 3 + 1] = average.g;
+			rgb[i * 3 + 2] = average.b;
+		}
+		return ImageExport::SaveHDR(path, width, height, rgb.data());
+	}
+
+	std::vector<uint32_t> pixels;
+	if (m_Settings.UseGPU)
+		m_GpuPathTracer.ReadDisplayImage(pixels);
+	else
+		pixels.assign(m_ImageData, m_ImageData + pixelCount);
+	return ImageExport::SavePNG(path, width, height, pixels.data());
 }
 
 VkDescriptorSet Renderer::GetFinalImageDescriptorSet() const {

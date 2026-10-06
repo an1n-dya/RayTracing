@@ -12,6 +12,8 @@ project "RayTracing"
       "../Walnut/vendor/imgui",
       "../Walnut/vendor/glfw/include",
       "../Walnut/vendor/glm",
+      "../Walnut/vendor/stb_image",  -- stb_image is compiled into Walnut
+      "../Walnut/vendor/glfw/deps",  -- stb_image_write.h (implementation compiled in ImageExport.cpp)
 
       "../Walnut/Walnut/src",
 

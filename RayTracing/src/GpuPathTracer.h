@@ -6,7 +6,10 @@
 
 #include <vulkan/vulkan.h>
 
+#include <glm/glm.hpp>
+
 #include <cstdint>
+#include <vector>
 
 // Vulkan compute-shader path tracer. Owns its own storage image (never touches Walnut::Image),
 // which it registers directly with ImGui via ImGui_ImplVulkan_AddTexture so it can be drawn
@@ -24,6 +27,10 @@ public:
 	// frame.SampleCount = 0 skips path tracing and only re-resolves the accumulated image to the display image
 	void Render(const Scene& scene, const Camera& camera, const RenderSettings& settings, const FrameParams& frame);
 
+	// Synchronous GPU -> CPU copies of the current images (rows bottom-up, like the CPU path's buffers)
+	void ReadDisplayImage(std::vector<uint32_t>& pixels);        // tone mapped RGBA8
+	void ReadAccumulationImage(std::vector<glm::vec4>& pixels);  // rgb = radiance sum, a = sample count
+
 	VkDescriptorSet GetDescriptorSet() const { return m_DisplayDescriptorSet; }
 	uint32_t GetWidth() const { return m_Width; }
 	uint32_t GetHeight() const { return m_Height; }
@@ -32,6 +39,7 @@ private:
 	void Init();
 	void CreateImages(uint32_t width, uint32_t height);
 	void ReleaseImages();
+	void ReadImage(VkImage image, VkDeviceSize bytesPerPixel, void* destination);
 
 private:
 	static constexpr uint32_t MaxSpheres = 64;

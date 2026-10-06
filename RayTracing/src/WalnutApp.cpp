@@ -6,16 +6,54 @@
 
 #include "Renderer.h"
 #include "Camera.h"
+#include "FileDialogs.h"
 
-#include <glm/gtc/type_ptr.hpp>	
+#include <glm/gtc/type_ptr.hpp>
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 
 using namespace Walnut;
 
+// Command-line options. With --render the app renders until --samples samples per pixel have accumulated,
+// writes the image (.png = tone mapped, .hdr = linear) and exits.
+struct AppOptions {
+	std::string RenderOutputPath;
+	int RenderSamples = 256;
+	int UseGPU = -1; // -1 = keep the default, 0 = --cpu, 1 = --gpu
+};
+
+static AppOptions ParseCommandLine(int argc, char** argv) {
+	AppOptions options;
+	for (int i = 1; i < argc; i++) {
+		const char* arg = argv[i];
+		bool hasValue = i + 1 < argc;
+		if (strcmp(arg, "--render") == 0 && hasValue)
+			options.RenderOutputPath = argv[++i];
+		else if (strcmp(arg, "--samples") == 0 && hasValue)
+			options.RenderSamples = std::max(atoi(argv[++i]), 1);
+		else if (strcmp(arg, "--gpu") == 0)
+			options.UseGPU = 1;
+		else if (strcmp(arg, "--cpu") == 0)
+			options.UseGPU = 0;
+		else
+			fprintf(stderr, "Unknown or incomplete argument: %s\n", arg);
+	}
+	return options;
+}
+
 class AppLayer : public Walnut::Layer {
 public:
-	AppLayer()
-		: m_Camera(45.0f, 0.1f, 100.0f)
+	AppLayer(const AppOptions& options)
+		: m_Camera(45.0f, 0.1f, 100.0f), m_Options(options)
 	{
+		if (m_Options.UseGPU >= 0)
+			m_Renderer.GetSettings().UseGPU = m_Options.UseGPU == 1;
+		if (!m_Options.RenderOutputPath.empty())
+			m_Renderer.GetSettings().MaxSamples = m_Options.RenderSamples;
+
 		Material& pinkSphere = m_Scene.Materials.emplace_back();
 		pinkSphere.Albedo = { 1.0f, 0.0f, 1.0f };
 		pinkSphere.Roughness = 0.0f;
@@ -70,6 +108,9 @@ public:
 			ImGui::Text("Samples: %u", m_Renderer.GetSampleCount());
 		if (ImGui::Button("Render"))
 			Render();
+		ImGui::SameLine();
+		if (ImGui::Button("Export Image..."))
+			ExportImage();
 
 		ImGui::Checkbox("Accumulate", &m_Renderer.GetSettings().Accumulate);
 		ImGui::SameLine();
@@ -194,6 +235,33 @@ public:
 		ImGui::PopStyleVar();
 
 		Render();
+
+		// Batch mode (--render): save once the requested number of samples has accumulated, then quit
+		if (!m_Options.RenderOutputPath.empty() && m_Renderer.IsConverged()) {
+			bool saved = m_Renderer.SaveImage(m_Options.RenderOutputPath);
+			printf("%s %s (%u spp, %ux%u, %s)\n", saved ? "Saved" : "FAILED to save", m_Options.RenderOutputPath.c_str(),
+				m_Renderer.GetSampleCount(), m_Renderer.GetFinalImageWidth(), m_Renderer.GetFinalImageHeight(),
+				m_Renderer.GetSettings().UseGPU ? "GPU" : "CPU");
+			m_Options.RenderOutputPath.clear();
+			Application::Get().Close();
+		}
+	}
+
+	void OnMenuBar() {
+		if (ImGui::BeginMenu("File")) {
+			if (ImGui::MenuItem("Export Image..."))
+				ExportImage();
+			ImGui::Separator();
+			if (ImGui::MenuItem("Exit"))
+				Application::Get().Close();
+			ImGui::EndMenu();
+		}
+	}
+
+	void ExportImage() {
+		std::string path = FileDialogs::SaveFile("PNG image (*.png)\0*.png\0Radiance HDR, linear (*.hdr)\0*.hdr\0", "png");
+		if (!path.empty() && !m_Renderer.SaveImage(path))
+			fprintf(stderr, "Failed to save image to %s\n", path.c_str());
 	}
 
 	void Render() {
@@ -215,6 +283,8 @@ private:
 
 	float m_LastRenderTime = 0.0f;
 	float m_FPS = 0.0f;
+
+	AppOptions m_Options;
 };
 
 Walnut::Application* Walnut::CreateApplication(int argc, char** argv) {
@@ -222,17 +292,8 @@ Walnut::Application* Walnut::CreateApplication(int argc, char** argv) {
 	spec.Name = "Ray Tracing";
 
 	Walnut::Application* app = new Walnut::Application(spec);
-	app->PushLayer<AppLayer>();
-	app->SetMenubarCallback([app]()
-	{
-		if (ImGui::BeginMenu("File"))
-		{
-			if (ImGui::MenuItem("Exit"))
-			{
-				app->Close();
-			}
-			ImGui::EndMenu();
-		}
-	});
+	std::shared_ptr<AppLayer> layer = std::make_shared<AppLayer>(ParseCommandLine(argc, argv));
+	app->PushLayer(layer);
+	app->SetMenubarCallback([layer]() { layer->OnMenuBar(); });
 	return app;
 }

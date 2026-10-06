@@ -412,6 +412,74 @@ void GpuPathTracer::CreateImages(uint32_t width, uint32_t height)
 	vkUpdateDescriptorSets(Walnut::Application::GetDevice(), 2, writes, 0, nullptr);
 }
 
+void GpuPathTracer::ReadImage(VkImage image, VkDeviceSize bytesPerPixel, void* destination)
+{
+	VkDevice device = Walnut::Application::GetDevice();
+	VkDeviceSize size = (VkDeviceSize)m_Width * m_Height * bytesPerPixel;
+
+	VkBuffer buffer;
+	VkDeviceMemory memory;
+	void* mapped = nullptr;
+	CreateBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, buffer, memory, &mapped);
+
+	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
+
+	// Compute writes -> transfer read (the image stays in GENERAL)
+	VkImageMemoryBarrier imageBarrier{};
+	imageBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	imageBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	imageBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	imageBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+	imageBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+	imageBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	imageBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	imageBarrier.image = image;
+	imageBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	imageBarrier.subresourceRange.levelCount = 1;
+	imageBarrier.subresourceRange.layerCount = 1;
+	vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0, 0, nullptr, 0, nullptr, 1, &imageBarrier);
+
+	VkBufferImageCopy region{};
+	region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	region.imageSubresource.layerCount = 1;
+	region.imageExtent = { m_Width, m_Height, 1 };
+	vkCmdCopyImageToBuffer(commandBuffer, image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &region);
+
+	VkBufferMemoryBarrier bufferBarrier{};
+	bufferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+	bufferBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	bufferBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+	bufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	bufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	bufferBarrier.buffer = buffer;
+	bufferBarrier.size = VK_WHOLE_SIZE;
+	vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+		0, 0, nullptr, 1, &bufferBarrier, 0, nullptr);
+
+	Walnut::Application::FlushCommandBuffer(commandBuffer); // waits for completion
+
+	memcpy(destination, mapped, (size_t)size);
+
+	vkUnmapMemory(device, memory);
+	vkDestroyBuffer(device, buffer, nullptr);
+	vkFreeMemory(device, memory, nullptr);
+}
+
+void GpuPathTracer::ReadDisplayImage(std::vector<uint32_t>& pixels)
+{
+	pixels.resize((size_t)m_Width * m_Height);
+	if (m_DisplayImage != VK_NULL_HANDLE)
+		ReadImage(m_DisplayImage, sizeof(uint32_t), pixels.data());
+}
+
+void GpuPathTracer::ReadAccumulationImage(std::vector<glm::vec4>& pixels)
+{
+	pixels.resize((size_t)m_Width * m_Height);
+	if (m_AccumulationImage != VK_NULL_HANDLE)
+		ReadImage(m_AccumulationImage, sizeof(glm::vec4), pixels.data());
+}
+
 void GpuPathTracer::OnResize(uint32_t width, uint32_t height)
 {
 	if (width == 0 || height == 0)

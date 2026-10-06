@@ -9,6 +9,7 @@
 #include "Scene.h"
 
 #include <memory>
+#include <string>
 #include <glm/glm.hpp>
 
 class Renderer {
@@ -21,6 +22,9 @@ public:
 	// Returns false once Settings.MaxSamples is reached; the accumulated image is still re-resolved
 	// (tone mapped) every call so post-processing settings stay live
 	bool Render(const Scene& scene, const Camera& camera);
+
+	// Writes the current image from whichever path is active: .hdr = linear radiance, anything else = tone mapped PNG
+	bool SaveImage(const std::string& path);
 
 	VkDescriptorSet GetFinalImageDescriptorSet() const;
 	uint32_t GetFinalImageWidth() const;
