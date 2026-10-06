@@ -1,14 +1,19 @@
 #version 450
 
 // GPU port of the CPU path tracer in Renderer.cpp (Renderer::PerPixel / TraceRay / ClosestHit / Miss).
-// Keeps the same math, RNG, and 5-bounce loop so CPU and GPU output match.
+// Keeps the same math, RNG, and bounce loop so CPU and GPU output match.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(std140, binding = 0) uniform CameraData {
+layout(std140, binding = 0) uniform FrameData {
 	mat4 InverseProjection;
 	mat4 InverseView;
 	vec4 Position; // xyz used
+
+	// Scene::Sky
+	vec4 SkyBottomColor; // rgb = color, w = intensity
+	vec4 SkyTopColor;    // rgb = color
+	int SkyMode;         // 0 = none, 1 = gradient
 } u_Camera;
 
 struct Sphere {
@@ -62,6 +67,16 @@ vec3 RandomInUnitSphere(inout uint seed)
 		RandomFloat(seed) * 2.0 - 1.0,
 		RandomFloat(seed) * 2.0 - 1.0,
 		RandomFloat(seed) * 2.0 - 1.0));
+}
+
+// -- Sky: same as Sky::GetRadiance in Scene.h --
+
+vec3 SkyRadiance(vec3 direction)
+{
+	if (u_Camera.SkyMode == 0)
+		return vec3(0.0);
+	float t = 0.5 * (direction.y + 1.0);
+	return mix(u_Camera.SkyBottomColor.rgb, u_Camera.SkyTopColor.rgb, t) * u_Camera.SkyBottomColor.w;
 }
 
 // -- Ray/scene intersection: same as Renderer::TraceRay / ClosestHit / Miss --
@@ -155,7 +170,10 @@ vec3 PerPixel(uvec2 pixelCoord)
 
 		HitPayload payload = TraceRay(rayOrigin, rayDirection);
 		if (payload.HitDistance < 0.0)
-			break; // sky term intentionally unused, matching the CPU renderer
+		{
+			light += SkyRadiance(rayDirection) * contribution;
+			break;
+		}
 
 		int materialIndex = Spheres[payload.ObjectIndex].MaterialIndex.x;
 		vec3 albedo = Materials[materialIndex].AlbedoRoughness.rgb;

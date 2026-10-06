@@ -21,7 +21,27 @@ struct Sphere {
 	int MaterialIndex = 0;
 };
 
+enum class SkyMode : int {
+	None = 0,     // black: the scene is lit only by emissive materials
+	Gradient = 1, // vertical gradient between BottomColor (straight down) and TopColor (straight up)
+};
+
+struct SkySettings {
+	SkyMode Mode = SkyMode::None;
+	glm::vec3 BottomColor{ 1.0f, 1.0f, 1.0f };
+	glm::vec3 TopColor{ 0.5f, 0.7f, 1.0f };
+	float Intensity = 1.0f;
+
+	glm::vec3 GetRadiance(const glm::vec3& direction) const {
+		if (Mode == SkyMode::None)
+			return glm::vec3(0.0f);
+		float t = 0.5f * (direction.y + 1.0f);
+		return glm::mix(BottomColor, TopColor, t) * Intensity;
+	}
+};
+
 struct Scene{
 	std::vector<Sphere> Spheres;
 	std::vector<Material> Materials;
+	SkySettings Sky;
 };

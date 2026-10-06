@@ -122,6 +122,24 @@ public:
 
 		ImGui::End();
 
+		ImGui::Begin("Environment");
+		{
+			SkySettings& sky = m_Scene.Sky;
+			const char* skyModes[] = { "None", "Gradient" };
+			int skyMode = (int)sky.Mode;
+			if (ImGui::Combo("Sky", &skyMode, skyModes, IM_ARRAYSIZE(skyModes))) {
+				sky.Mode = (SkyMode)skyMode;
+				sceneChanged = true;
+			}
+			if (sky.Mode == SkyMode::Gradient) {
+				sceneChanged |= ImGui::ColorEdit3("Top Color", glm::value_ptr(sky.TopColor));
+				sceneChanged |= ImGui::ColorEdit3("Bottom Color", glm::value_ptr(sky.BottomColor));
+			}
+			if (sky.Mode != SkyMode::None)
+				sceneChanged |= ImGui::DragFloat("Intensity", &sky.Intensity, 0.01f, 0.0f, 100.0f);
+		}
+		ImGui::End();
+
 		// Any edit invalidates the samples accumulated so far
 		if (sceneChanged)
 			m_Renderer.ResetFrameIndex();

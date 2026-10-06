@@ -30,6 +30,11 @@ namespace {
 		glm::mat4 InverseProjection;
 		glm::mat4 InverseView;
 		glm::vec4 Position;
+
+		glm::vec4 SkyBottomColor; // rgb = color, w = intensity
+		glm::vec4 SkyTopColor;
+		int32_t SkyMode;
+		int32_t Pad[3];
 	};
 
 	struct PushConstants {
@@ -424,6 +429,9 @@ void GpuPathTracer::Render(const Scene& scene, const Camera& camera, uint32_t fr
 	cameraData.InverseProjection = camera.GetInverseProjection();
 	cameraData.InverseView = camera.GetInverseView();
 	cameraData.Position = glm::vec4(camera.GetPosition(), 1.0f);
+	cameraData.SkyBottomColor = glm::vec4(scene.Sky.BottomColor, scene.Sky.Intensity);
+	cameraData.SkyTopColor = glm::vec4(scene.Sky.TopColor, 0.0f);
+	cameraData.SkyMode = (int32_t)scene.Sky.Mode;
 	memcpy(m_CameraUBOMapped, &cameraData, sizeof(cameraData));
 
 	uint32_t sphereCount = std::min((uint32_t)scene.Spheres.size(), MaxSpheres);
