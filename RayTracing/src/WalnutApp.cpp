@@ -98,6 +98,16 @@ public:
 				m_Renderer.ResetFrameIndex();
 		}
 
+		if (ImGui::CollapsingHeader("Post-processing", ImGuiTreeNodeFlags_DefaultOpen)) {
+			Renderer::Settings& settings = m_Renderer.GetSettings();
+			ImGui::SliderFloat("Exposure", &settings.Exposure, -8.0f, 8.0f, "%.2f EV");
+			const char* toneMappers[] = { "None (clamp)", "Reinhard", "ACES" };
+			int toneMapper = (int)settings.ToneMapping;
+			if (ImGui::Combo("Tone Mapping", &toneMapper, toneMappers, IM_ARRAYSIZE(toneMappers)))
+				settings.ToneMapping = (ToneMapper)toneMapper;
+			ImGui::Checkbox("sRGB Output", &settings.SRGBOutput);
+		}
+
 		if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
 			float verticalFOV = m_Camera.GetVerticalFOV();
 			if (ImGui::SliderFloat("Vertical FOV", &verticalFOV, 10.0f, 120.0f, "%.1f deg")) {

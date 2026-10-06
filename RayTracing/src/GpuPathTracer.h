@@ -21,7 +21,8 @@ public:
 	GpuPathTracer& operator=(const GpuPathTracer&) = delete;
 
 	void OnResize(uint32_t width, uint32_t height);
-	void Render(const Scene& scene, const Camera& camera, uint32_t frameIndex, const RenderSettings& settings);
+	// trace = false skips path tracing and only re-resolves the accumulated image to the display image
+	void Render(const Scene& scene, const Camera& camera, uint32_t frameIndex, const RenderSettings& settings, bool trace);
 
 	VkDescriptorSet GetDescriptorSet() const { return m_DisplayDescriptorSet; }
 	uint32_t GetWidth() const { return m_Width; }

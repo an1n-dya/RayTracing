@@ -1,5 +1,11 @@
 #pragma once
 
+enum class ToneMapper : int {
+	None = 0,     // clamp
+	Reinhard = 1,
+	ACES = 2,
+};
+
 // User-facing renderer options, shared by the CPU path (Renderer) and the GPU path (GpuPathTracer).
 struct RenderSettings {
 	bool Accumulate = true;
@@ -10,4 +16,9 @@ struct RenderSettings {
 	int MaxBounces = 5;
 	bool RussianRoulette = true;
 	int RussianRouletteStartBounce = 3; // paths are never terminated before this bounce
+
+	// Post-processing (applied to the accumulated image, so changing these never restarts accumulation)
+	float Exposure = 0.0f; // in stops (EV)
+	ToneMapper ToneMapping = ToneMapper::ACES;
+	bool SRGBOutput = true; // the swapchain is UNORM, so encode to sRGB ourselves
 };

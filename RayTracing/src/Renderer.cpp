@@ -1,15 +1,18 @@
 #include "Renderer.h"
 
+#include "ToneMapping.h"
+
 #include "Walnut/Random.h"
 
 #include <execution>
 
 namespace Utils {
 	static uint32_t ConvertToRGBA(const glm::vec4& color) {
-		uint8_t r = static_cast<uint8_t>(color.r * 255.0f);
-		uint8_t g = static_cast<uint8_t>(color.g * 255.0f);
-		uint8_t b = static_cast<uint8_t>(color.b * 255.0f);
-		uint8_t a = static_cast<uint8_t>(color.a * 255.0f);
+		// Round to nearest, like the GPU's UNORM image stores
+		uint8_t r = static_cast<uint8_t>(color.r * 255.0f + 0.5f);
+		uint8_t g = static_cast<uint8_t>(color.g * 255.0f + 0.5f);
+		uint8_t b = static_cast<uint8_t>(color.b * 255.0f + 0.5f);
+		uint8_t a = static_cast<uint8_t>(color.a * 255.0f + 0.5f);
 
 		return (a << 24) | (b << 16) | (g << 8) | r;
 	}
@@ -31,6 +34,21 @@ namespace Utils {
 			RandomFloat(seed) * 2.0f - 1.0f,
 			RandomFloat(seed) * 2.0f - 1.0f)
 		);
+	}
+
+#define MT 1
+	// Runs fn(x, y) for every pixel, in parallel unless MT is 0
+	template<typename Fn>
+	static void ForEachPixel(const std::vector<uint32_t>& xs, const std::vector<uint32_t>& ys, Fn&& fn) {
+#if MT
+		std::for_each(std::execution::par, ys.begin(), ys.end(), [&](uint32_t y) {
+			std::for_each(std::execution::par, xs.begin(), xs.end(), [&](uint32_t x) { fn(x, y); });
+		});
+#else
+		for (uint32_t y : ys)
+			for (uint32_t x : xs)
+				fn(x, y);
+#endif
 	}
 }
 
@@ -71,52 +89,32 @@ bool Renderer::Render(const Scene& scene, const Camera& camera) {
 	if (!m_FinalImage || !m_ImageData)
 		return false;
 
-	if (IsConverged())
-		return false;
-
 	m_ActiveScene = &scene;
 	m_ActiveCamera = &camera;
 
+	// Once converged, only re-resolve the accumulated image (so exposure/tone mapping stay live)
+	bool trace = !IsConverged();
+
 	if (m_Settings.UseGPU) {
-		m_GpuPathTracer.Render(scene, camera, m_FrameIndex, m_Settings);
+		m_GpuPathTracer.Render(scene, camera, m_FrameIndex, m_Settings, trace);
 	}
 	else {
-		if (m_FrameIndex == 1)
-			memset(m_AccumulationData, 0, m_FinalImage->GetWidth() * m_FinalImage->GetHeight() * sizeof(glm::vec4));
+		uint32_t width = m_FinalImage->GetWidth();
+		if (trace && m_FrameIndex == 1)
+			memset(m_AccumulationData, 0, width * m_FinalImage->GetHeight() * sizeof(glm::vec4));
 
-#define MT 1
-#if MT
-		std::for_each(std::execution::par, m_ImageVerticalIter.begin(), m_ImageVerticalIter.end(),
-			[this](uint32_t y) {
-				std::for_each(std::execution::par, m_ImageHorizontalIter.begin(), m_ImageHorizontalIter.end(),
-					[this, y](uint32_t x) {
-						glm::vec4 color = PerPixel(x, y);
-						m_AccumulationData[x + y * m_FinalImage->GetWidth()] += color;
-
-						glm::vec4 accumulatedColor = m_AccumulationData[x + y * m_FinalImage->GetWidth()];
-						accumulatedColor /= (float)m_FrameIndex;
-
-						accumulatedColor = glm::clamp(accumulatedColor, glm::vec4(0.0f), glm::vec4(1.0f));
-						m_ImageData[x + y * m_FinalImage->GetWidth()] = Utils::ConvertToRGBA(accumulatedColor);
-					});
-			});
-#else
-		for (uint32_t y = 0; y < m_FinalImage->GetHeight(); y++) {
-			for (uint32_t x = 0; x < m_FinalImage->GetWidth(); x++) {
-				glm::vec4 color = PerPixel(x, y);
-				m_AccumulationData[x + y * m_FinalImage->GetWidth()] += color;
-
-				glm::vec4 accumulatedColor = m_AccumulationData[x + y * m_FinalImage->GetWidth()];
-				accumulatedColor /= (float)m_FrameIndex;
-
-				accumulatedColor = glm::clamp(accumulatedColor, glm::vec4(0.0f), glm::vec4(1.0f));
-				m_ImageData[x + y * m_FinalImage->GetWidth()] = Utils::ConvertToRGBA(accumulatedColor);
-			}
-		}
-#endif
+		Utils::ForEachPixel(m_ImageHorizontalIter, m_ImageVerticalIter, [this, trace, width](uint32_t x, uint32_t y) {
+			uint32_t index = x + y * width;
+			if (trace)
+				m_AccumulationData[index] += PerPixel(x, y);
+			m_ImageData[index] = Utils::ConvertToRGBA(ToneMapping::Resolve(m_AccumulationData[index], m_Settings));
+		});
 
 		m_FinalImage->SetData(m_ImageData);
 	}
+
+	if (!trace)
+		return false;
 
 	m_SampleCount = m_FrameIndex;
 

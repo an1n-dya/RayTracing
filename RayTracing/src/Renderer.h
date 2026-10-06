@@ -18,7 +18,8 @@ public:
 	Renderer() = default;
 
 	void OnResize(uint32_t width, uint32_t height);
-	// Returns false (and leaves the previous image in place) once Settings.MaxSamples is reached
+	// Returns false once Settings.MaxSamples is reached; the accumulated image is still re-resolved
+	// (tone mapped) every call so post-processing settings stay live
 	bool Render(const Scene& scene, const Camera& camera);
 
 	VkDescriptorSet GetFinalImageDescriptorSet() const;
