@@ -78,14 +78,16 @@ public:
 
 		ImGui::End();
 
+		bool sceneChanged = false;
+
 		ImGui::Begin("Scene");
 		for (size_t i = 0; i < m_Scene.Spheres.size(); i++) {
 			ImGui::PushID(i);
 
 			Sphere& sphere = m_Scene.Spheres[i];
-			ImGui::DragFloat3("Position", glm::value_ptr(sphere.Position), 0.1f);
-			ImGui::DragFloat("Radius", &sphere.Radius, 0.1f);
-			ImGui::DragInt("Material", &sphere.MaterialIndex, 1.0f, 0, (int)m_Scene.Materials.size() - 1);
+			sceneChanged |= ImGui::DragFloat3("Position", glm::value_ptr(sphere.Position), 0.1f);
+			sceneChanged |= ImGui::DragFloat("Radius", &sphere.Radius, 0.1f);
+			sceneChanged |= ImGui::DragInt("Material", &sphere.MaterialIndex, 1.0f, 0, (int)m_Scene.Materials.size() - 1);
 
 			ImGui::Separator();
 
@@ -96,11 +98,11 @@ public:
 			ImGui::PushID(i);		
 
 			Material& material = m_Scene.Materials[i];
-			ImGui::ColorEdit3("Albedo", glm::value_ptr(material.Albedo));
-			ImGui::DragFloat("Roughness", &material.Roughness, 0.05f, 0.0f, 1.0f);
-			ImGui::DragFloat("Metallic", &material.Metallic, 0.05f, 0.0f, 1.0f);
-			ImGui::ColorEdit3("Emission Color", glm::value_ptr(material.EmissionColor));
-			ImGui::DragFloat("Emission Power", &material.EmissionPower, 0.05f, 0.0f, FLT_MAX);
+			sceneChanged |= ImGui::ColorEdit3("Albedo", glm::value_ptr(material.Albedo));
+			sceneChanged |= ImGui::DragFloat("Roughness", &material.Roughness, 0.05f, 0.0f, 1.0f);
+			sceneChanged |= ImGui::DragFloat("Metallic", &material.Metallic, 0.05f, 0.0f, 1.0f);
+			sceneChanged |= ImGui::ColorEdit3("Emission Color", glm::value_ptr(material.EmissionColor));
+			sceneChanged |= ImGui::DragFloat("Emission Power", &material.EmissionPower, 0.05f, 0.0f, FLT_MAX);
 
 			ImGui::Separator();
 
@@ -108,6 +110,10 @@ public:
 		}
 
 		ImGui::End();
+
+		// Any edit invalidates the samples accumulated so far
+		if (sceneChanged)
+			m_Renderer.ResetFrameIndex();
 
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
 		ImGui::Begin("Viewport");
