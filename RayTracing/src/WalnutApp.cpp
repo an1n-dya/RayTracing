@@ -7,21 +7,31 @@
 #include "Renderer.h"
 #include "Camera.h"
 #include "FileDialogs.h"
+#include "SceneSerializer.h"
 
 #include "imgui_internal.h" // DockId lookup for default panel placement
 
 #include <glm/gtc/type_ptr.hpp>
 
+#include <GLFW/glfw3.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 
 using namespace Walnut;
 
-// Command-line options. With --render the app renders until --samples samples per pixel have accumulated,
-// writes the image (.png = tone mapped, .hdr = linear) and exits.
+// Command-line options:
+//   --scene <file.json>        open a scene at startup
+//   --save-scene <file.json>   write the (loaded) scene back out; exits unless --render is given too
+//   --render <out.png|.hdr>    render until --samples <n> samples per pixel have accumulated, save, exit
+//   --cpu / --gpu              pick the render path
+//   --compare split|difference CPU vs GPU compare view
 struct AppOptions {
+	std::string ScenePath;
+	std::string SaveScenePath;
 	std::string RenderOutputPath;
 	int RenderSamples = 256;
 	int UseGPU = -1; // -1 = keep the default, 0 = --cpu, 1 = --gpu
@@ -33,7 +43,11 @@ static AppOptions ParseCommandLine(int argc, char** argv) {
 	for (int i = 1; i < argc; i++) {
 		const char* arg = argv[i];
 		bool hasValue = i + 1 < argc;
-		if (strcmp(arg, "--render") == 0 && hasValue)
+		if (strcmp(arg, "--scene") == 0 && hasValue)
+			options.ScenePath = argv[++i];
+		else if (strcmp(arg, "--save-scene") == 0 && hasValue)
+			options.SaveScenePath = argv[++i];
+		else if (strcmp(arg, "--render") == 0 && hasValue)
 			options.RenderOutputPath = argv[++i];
 		else if (strcmp(arg, "--samples") == 0 && hasValue)
 			options.RenderSamples = std::max(atoi(argv[++i]), 1);
@@ -73,13 +87,39 @@ public:
 		CreateDefaultScene();
 	}
 
+	virtual void OnAttach() override {
+		// After the window exists, so the title can be set
+		if (!m_Options.ScenePath.empty())
+			OpenScene(m_Options.ScenePath);
+		else
+			UpdateWindowTitle();
+
+		if (!m_Options.SaveScenePath.empty()) {
+			std::string error;
+			if (SceneSerializer::Save(m_Options.SaveScenePath, m_Scene, m_Camera, &error))
+				printf("Saved %s\n", m_Options.SaveScenePath.c_str());
+			else
+				fprintf(stderr, "Couldn't save scene: %s\n", error.c_str());
+			// Application::Run() hasn't started yet (it would reset a Close() made now), so quit on the first frame
+			m_CloseRequested = m_Options.RenderOutputPath.empty();
+		}
+	}
+
 	virtual void OnUpdate(float ts) override {
 		if (m_Camera.OnUpdate(ts))
 			m_Renderer.ResetFrameIndex();
 	}
 
 	virtual void OnUIRender() override {
+		if (m_CloseRequested) {
+			Application::Get().Close();
+			return;
+		}
+
 		m_SceneChanged = false;
+
+		HandleShortcuts();
+		DrawErrorPopup();
 
 		DrawSettingsPanel();
 		DrawScenePanel();
@@ -107,7 +147,16 @@ public:
 
 	void OnMenuBar() {
 		if (ImGui::BeginMenu("File")) {
-			if (ImGui::MenuItem("Export Image..."))
+			if (ImGui::MenuItem("New Scene", "Ctrl+N"))
+				NewScene();
+			if (ImGui::MenuItem("Open Scene...", "Ctrl+O"))
+				OpenSceneDialog();
+			if (ImGui::MenuItem("Save Scene", "Ctrl+S"))
+				SaveScene();
+			if (ImGui::MenuItem("Save Scene As...", "Ctrl+Shift+S"))
+				SaveSceneAs();
+			ImGui::Separator();
+			if (ImGui::MenuItem("Export Image...", "Ctrl+E"))
 				ExportImage();
 			ImGui::Separator();
 			if (ImGui::MenuItem("Exit"))
@@ -117,6 +166,96 @@ public:
 	}
 
 private:
+	static constexpr const char* SceneFileFilter = "Scene (*.json)\0*.json\0All files\0*.*\0";
+
+	void HandleShortcuts() {
+		ImGuiIO& io = ImGui::GetIO();
+		if (!io.KeyCtrl || io.WantTextInput)
+			return;
+		if (ImGui::IsKeyPressed(ImGuiKey_N, false))
+			NewScene();
+		else if (ImGui::IsKeyPressed(ImGuiKey_O, false))
+			OpenSceneDialog();
+		else if (ImGui::IsKeyPressed(ImGuiKey_S, false))
+			io.KeyShift ? SaveSceneAs() : SaveScene();
+		else if (ImGui::IsKeyPressed(ImGuiKey_E, false))
+			ExportImage();
+	}
+
+	void ShowError(const std::string& message) {
+		fprintf(stderr, "%s\n", message.c_str());
+		m_ErrorMessage = message;
+	}
+
+	void DrawErrorPopup() {
+		if (!m_ErrorMessage.empty() && !ImGui::IsPopupOpen("Error"))
+			ImGui::OpenPopup("Error");
+		if (ImGui::BeginPopupModal("Error", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+			ImGui::TextUnformatted(m_ErrorMessage.c_str());
+			if (ImGui::Button("OK", ImVec2(120.0f, 0.0f))) {
+				m_ErrorMessage.clear();
+				ImGui::CloseCurrentPopup();
+			}
+			ImGui::EndPopup();
+		}
+	}
+
+	void UpdateWindowTitle() {
+		std::string title = "Ray Tracing";
+		if (!m_ScenePath.empty())
+			title += " - " + std::filesystem::path(m_ScenePath).filename().string();
+		glfwSetWindowTitle(Application::Get().GetWindowHandle(), title.c_str());
+	}
+
+	void OnSceneReplaced() {
+		m_Selection = {};
+		m_Renderer.ResetFrameIndex();
+		UpdateWindowTitle();
+	}
+
+	void NewScene() {
+		m_Scene = Scene();
+		m_Scene.Materials.emplace_back().Name = "Default";
+		m_Scene.Sky.Mode = SkyMode::Gradient; // an empty scene with no lights would just be black
+		m_ScenePath.clear();
+		OnSceneReplaced();
+	}
+
+	void OpenSceneDialog() {
+		std::string path = FileDialogs::OpenFile(SceneFileFilter);
+		if (!path.empty())
+			OpenScene(path);
+	}
+
+	void OpenScene(const std::string& path) {
+		std::string error;
+		if (!SceneSerializer::Load(path, m_Scene, m_Camera, &error)) {
+			ShowError("Couldn't open scene:\n" + error);
+			return;
+		}
+		m_ScenePath = path;
+		OnSceneReplaced();
+	}
+
+	void SaveScene() {
+		if (m_ScenePath.empty()) {
+			SaveSceneAs();
+			return;
+		}
+		std::string error;
+		if (!SceneSerializer::Save(m_ScenePath, m_Scene, m_Camera, &error))
+			ShowError("Couldn't save scene:\n" + error);
+	}
+
+	void SaveSceneAs() {
+		std::string path = FileDialogs::SaveFile(SceneFileFilter, "json");
+		if (path.empty())
+			return;
+		m_ScenePath = path;
+		SaveScene();
+		UpdateWindowTitle();
+	}
+
 	void CreateDefaultScene() {
 		Material& pinkSphere = m_Scene.Materials.emplace_back();
 		pinkSphere.Name = "Pink";
@@ -521,7 +660,7 @@ private:
 	void ExportImage() {
 		std::string path = FileDialogs::SaveFile("PNG image (*.png)\0*.png\0Radiance HDR, linear (*.hdr)\0*.hdr\0", "png");
 		if (!path.empty() && !m_Renderer.SaveImage(path))
-			fprintf(stderr, "Failed to save image to %s\n", path.c_str());
+			ShowError("Couldn't save image to " + path);
 	}
 
 	void Render() {
@@ -540,6 +679,10 @@ private:
 	Camera m_Camera;
 	Scene m_Scene;
 	uint32_t m_ViewportWidth = 0, m_ViewportHeight = 0;
+
+	std::string m_ScenePath;   // empty until the scene is saved or opened
+	std::string m_ErrorMessage; // shown in a modal popup while non-empty
+	bool m_CloseRequested = false;
 
 	ObjectRef m_Selection;
 	bool m_DraggingDivider = false; // CompareMode::Split

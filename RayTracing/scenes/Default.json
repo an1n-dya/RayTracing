@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "camera": {
+    "position": [0, 0, 6],
+    "direction": [0, 0, -1],
+    "verticalFov": 45,
+    "aperture": 0,
+    "focusDistance": 6,
+    "moveSpeed": 5
+  },
+  "sky": {
+    "mode": "none",
+    "topColor": [0.5, 0.7, 1],
+    "bottomColor": [1, 1, 1],
+    "intensity": 1
+  },
+  "materials": [
+    {
+      "name": "Pink",
+      "albedo": [1, 0, 1],
+      "roughness": 0,
+      "metallic": 0,
+      "transmission": 0,
+      "ior": 1.5,
+      "emissionColor": [0, 0, 0],
+      "emissionPower": 0
+    },
+    {
+      "name": "Blue",
+      "albedo": [0.2, 0.3, 1],
+      "roughness": 0.1,
+      "metallic": 0,
+      "transmission": 0,
+      "ior": 1.5,
+      "emissionColor": [0, 0, 0],
+      "emissionPower": 0
+    },
+    {
+      "name": "Orange Light",
+      "albedo": [0.8, 0.5, 0.2],
+      "roughness": 0.1,
+      "metallic": 0,
+      "transmission": 0,
+      "ior": 1.5,
+      "emissionColor": [0.8, 0.5, 0.2],
+      "emissionPower": 2
+    }
+  ],
+  "spheres": [
+    {
+      "position": [0, 0, 0],
+      "radius": 1,
+      "material": 0
+    },
+    {
+      "position": [0, -101, 0],
+      "radius": 100,
+      "material": 1
+    },
+    {
+      "position": [2, 0, 0],
+      "radius": 1,
+      "material": 2
+    }
+  ]
+}

@@ -20,6 +20,7 @@ public:
 	
 	const glm::vec3& GetPosition() const { return m_Position; }
 	const glm::vec3& GetDirection() const { return m_ForwardDirection; }
+	void SetView(const glm::vec3& position, const glm::vec3& direction);
 
 	float GetVerticalFOV() const { return m_VerticalFOV; }
 	void SetVerticalFOV(float verticalFOV);

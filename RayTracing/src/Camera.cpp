@@ -100,6 +100,14 @@ void Camera::OnResize(uint32_t width, uint32_t height)
 	RecalculateProjection();
 }
 
+void Camera::SetView(const glm::vec3& position, const glm::vec3& direction)
+{
+	m_Position = position;
+	if (glm::dot(direction, direction) > 0.0f)
+		m_ForwardDirection = glm::normalize(direction);
+	RecalculateView();
+}
+
 void Camera::SetVerticalFOV(float verticalFOV)
 {
 	if (verticalFOV == m_VerticalFOV)
@@ -116,6 +124,9 @@ float Camera::GetRotationSpeed()
 
 void Camera::RecalculateProjection()
 {
+	if (m_ViewportWidth == 0 || m_ViewportHeight == 0)
+		return; // no viewport yet (e.g. a scene loaded at startup); OnResize will compute it
+
 	m_Projection = glm::perspectiveFov(glm::radians(m_VerticalFOV), (float)m_ViewportWidth, (float)m_ViewportHeight, m_NearClip, m_FarClip);
 	m_InverseProjection = glm::inverse(m_Projection);
 }
