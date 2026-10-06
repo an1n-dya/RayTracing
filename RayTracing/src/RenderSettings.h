@@ -13,6 +13,8 @@ struct RenderSettings {
 	bool SlowRandom = false; // CPU only: use Walnut::Random instead of the PCG hash
 	bool UseGPU = false;
 
+	bool AntiAliasing = true; // jitter each sample within its pixel (off = always the pixel center)
+
 	int MaxBounces = 5;
 	bool RussianRoulette = true;
 	int RussianRouletteStartBounce = 3; // paths are never terminated before this bounce

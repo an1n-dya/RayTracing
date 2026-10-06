@@ -25,13 +25,14 @@ public:
 	float GetMoveSpeed() const { return m_MoveSpeed; }
 	void SetMoveSpeed(float moveSpeed) { m_MoveSpeed = moveSpeed; }
 
-	const std::vector<glm::vec3>& GetRayDirections() const { return m_RayDirections; }
+	// World-space direction of the ray through ndc (each axis -1 -> 1 across the viewport).
+	// Computed per sample rather than cached per pixel so rays can be jittered for anti-aliasing.
+	glm::vec3 GetRayDirection(const glm::vec2& ndc) const;
 
 	float GetRotationSpeed();
 private:
 	void RecalculateProjection();
 	void RecalculateView();
-	void RecalculateRayDirections();
 private:
 	glm::mat4 m_Projection{ 1.0f };
 	glm::mat4 m_View{ 1.0f };
@@ -46,9 +47,6 @@ private:
 
 	glm::vec3 m_Position{0.0f, 0.0f, 0.0f};
 	glm::vec3 m_ForwardDirection{0.0f, 0.0f, 0.0f};
-
-	// Cached ray directions
-	std::vector<glm::vec3> m_RayDirections;
 
 	glm::vec2 m_LastMousePosition{ 0.0f, 0.0f };
 

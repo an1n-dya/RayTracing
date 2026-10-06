@@ -90,6 +90,7 @@ public:
 		if (ImGui::CollapsingHeader("Path Tracing", ImGuiTreeNodeFlags_DefaultOpen)) {
 			Renderer::Settings& settings = m_Renderer.GetSettings();
 			bool changed = false;
+			changed |= ImGui::Checkbox("Anti-aliasing", &settings.AntiAliasing);
 			changed |= ImGui::SliderInt("Max Bounces", &settings.MaxBounces, 1, 64);
 			changed |= ImGui::Checkbox("Russian Roulette", &settings.RussianRoulette);
 			if (settings.RussianRoulette)

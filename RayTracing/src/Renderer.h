@@ -39,7 +39,7 @@ private:
 		int ObjectIndex;
 	};
 
-	glm::vec4 PerPixel(uint32_t x, uint32_t y); // RayGen
+	glm::vec4 PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex); // RayGen
 
 	// Dispatch to the fast PCG hash or Walnut::Random depending on Settings.SlowRandom
 	float RandomFloat(uint32_t& seed) const;

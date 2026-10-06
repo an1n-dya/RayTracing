@@ -50,6 +50,7 @@ layout(push_constant) uniform PushConstants {
 	float Exposure;   // stops
 	uint ToneMapper;  // 0 = none, 1 = Reinhard, 2 = ACES
 	uint SRGBOutput;
+	uint AntiAliasing; // jitter samples within the pixel
 } u_PC;
 
 // -- RNG: same PCG hash as Utils::PCG_Hash / RandomFloat / InUnitSphere in Renderer.cpp --
@@ -185,9 +186,19 @@ HitPayload TraceRay(vec3 rayOrigin, vec3 rayDirection)
 	return ClosestHit(rayOrigin, rayDirection, hitDistance, closestSphere);
 }
 
-vec3 PerPixel(uvec2 pixelCoord)
+vec3 PerPixel(uvec2 pixelCoord, uint sampleIndex)
 {
-	vec2 coord = (vec2(pixelCoord) + vec2(0.5)) / vec2(u_PC.Width, u_PC.Height);
+	// Decorrelate pixels and samples: every (pixel, sample) pair gets its own random stream
+	uint seed = PCGHash((pixelCoord.x + pixelCoord.y * u_PC.Width) ^ PCGHash(sampleIndex));
+
+	vec2 jitter = vec2(0.5);
+	if (u_PC.AntiAliasing != 0u)
+	{
+		jitter.x = RandomFloat(seed);
+		jitter.y = RandomFloat(seed);
+	}
+
+	vec2 coord = (vec2(pixelCoord) + jitter) / vec2(u_PC.Width, u_PC.Height);
 	coord = coord * 2.0 - 1.0; // -1 -> 1
 
 	vec4 target = u_Camera.InverseProjection * vec4(coord.x, coord.y, 1.0, 1.0);
@@ -197,13 +208,8 @@ vec3 PerPixel(uvec2 pixelCoord)
 	vec3 light = vec3(0.0);
 	vec3 contribution = vec3(1.0);
 
-	uint seed = pixelCoord.x + pixelCoord.y * u_PC.Width;
-	seed *= u_PC.FrameIndex;
-
 	for (uint i = 0u; i < u_PC.Bounces; i++)
 	{
-		seed += i;
-
 		HitPayload payload = TraceRay(rayOrigin, rayDirection);
 		if (payload.HitDistance < 0.0)
 		{
@@ -245,7 +251,7 @@ void main()
 	vec4 accumulatedColor;
 	if (u_PC.Trace != 0u)
 	{
-		vec3 color = PerPixel(pixelCoord);
+		vec3 color = PerPixel(pixelCoord, u_PC.FrameIndex);
 
 		if (u_PC.FrameIndex == 1u)
 			accumulatedColor = vec4(color, 1.0);

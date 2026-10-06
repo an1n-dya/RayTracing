@@ -106,7 +106,7 @@ bool Renderer::Render(const Scene& scene, const Camera& camera) {
 		Utils::ForEachPixel(m_ImageHorizontalIter, m_ImageVerticalIter, [this, trace, width](uint32_t x, uint32_t y) {
 			uint32_t index = x + y * width;
 			if (trace)
-				m_AccumulationData[index] += PerPixel(x, y);
+				m_AccumulationData[index] += PerPixel(x, y, m_FrameIndex);
 			m_ImageData[index] = Utils::ConvertToRGBA(ToneMapping::Resolve(m_AccumulationData[index], m_Settings));
 		});
 
@@ -126,20 +126,25 @@ bool Renderer::Render(const Scene& scene, const Camera& camera) {
 	return true;
 }
 
-glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y) {
+glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex) {
+	// Decorrelate pixels and samples: every (pixel, sample) pair gets its own random stream
+	uint32_t seed = Utils::PCG_Hash((x + y * m_FinalImage->GetWidth()) ^ Utils::PCG_Hash(sampleIndex));
+
+	glm::vec2 jitter(0.5f);
+	if (m_Settings.AntiAliasing)
+		jitter = { RandomFloat(seed), RandomFloat(seed) };
+
+	glm::vec2 ndc = (glm::vec2((float)x, (float)y) + jitter) / glm::vec2((float)m_FinalImage->GetWidth(), (float)m_FinalImage->GetHeight());
+	ndc = ndc * 2.0f - 1.0f; // -1 -> 1
+
 	Ray ray;
 	ray.Origin = m_ActiveCamera->GetPosition();
-	ray.Direction = m_ActiveCamera->GetRayDirections()[x + y * m_FinalImage->GetWidth()];
+	ray.Direction = m_ActiveCamera->GetRayDirection(ndc);
 
 	glm::vec3 light(0.0f);
 	glm::vec3 contribution(1.0f);
 
-	uint32_t seed = x + y * m_FinalImage->GetWidth();
-	seed *= m_FrameIndex;
-
 	for (int i = 0; i < m_Settings.MaxBounces; i++) {
-		seed += i;
-
 		Renderer::HitPayload payload = TraceRay(ray);
 		if (payload.HitDistance < 0.0f) {
 			light += m_ActiveScene->Sky.GetRadiance(ray.Direction) * contribution;

@@ -49,6 +49,7 @@ namespace {
 		float Exposure;
 		uint32_t ToneMapper;
 		uint32_t SRGBOutput;
+		uint32_t AntiAliasing;
 	};
 
 	uint32_t FindMemoryType(VkMemoryPropertyFlags properties, uint32_t typeBits)
@@ -478,6 +479,7 @@ void GpuPathTracer::Render(const Scene& scene, const Camera& camera, uint32_t fr
 	pushConstants.Exposure = settings.Exposure;
 	pushConstants.ToneMapper = (uint32_t)settings.ToneMapping;
 	pushConstants.SRGBOutput = settings.SRGBOutput ? 1u : 0u;
+	pushConstants.AntiAliasing = settings.AntiAliasing ? 1u : 0u;
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
