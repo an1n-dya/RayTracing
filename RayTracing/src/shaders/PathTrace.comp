@@ -7,8 +7,16 @@
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 const float PI = 3.14159265358979323846;
+const float FLT_MAX = 3.402823466e+38;
+
+// Matches ObjectType in Scene.h
+const int OBJECT_NONE = 0;
+const int OBJECT_SPHERE = 1;
+const int OBJECT_PLANE = 2;
+const int OBJECT_MESH_INSTANCE = 3;
 
 #include "BSDF.glsl"
+#include "Intersection.glsl"
 
 layout(std140, binding = 0) uniform FrameData {
 	mat4 InverseProjection;
@@ -44,6 +52,42 @@ layout(std430, binding = 2) readonly buffer MaterialBuffer {
 layout(binding = 3, rgba32f) uniform image2D AccumulationImage;
 layout(binding = 4, rgba8) uniform image2D DisplayImage;
 
+struct Plane {
+	vec4 Point;          // xyz
+	vec4 Normal;         // xyz, unit length
+	ivec4 MaterialIndex; // x
+};
+
+layout(std430, binding = 5) readonly buffer PlaneBuffer {
+	Plane Planes[];
+};
+
+struct MeshInstance {
+	mat4 ObjectToWorld;
+	mat4 WorldToObject;
+	vec4 BoundsMin; // object space
+	vec4 BoundsMax;
+	uvec4 Info;     // x = first triangle (in Indices / 3), y = triangle count, z = material index
+};
+
+layout(std430, binding = 6) readonly buffer InstanceBuffer {
+	MeshInstance Instances[];
+};
+
+struct Vertex {
+	vec4 Position; // xyz
+	vec4 Normal;   // xyz
+};
+
+// All meshes' vertices and (global) triangle indices, concatenated
+layout(std430, binding = 7) readonly buffer VertexBuffer {
+	Vertex Vertices[];
+};
+
+layout(std430, binding = 8) readonly buffer IndexBuffer {
+	uint Indices[];
+};
+
 layout(push_constant) uniform PushConstants {
 	uint Width;
 	uint Height;
@@ -58,6 +102,8 @@ layout(push_constant) uniform PushConstants {
 	uint SRGBOutput;
 	uint AntiAliasing; // jitter samples within the pixel
 	uint ResetAccumulation;
+	uint PlaneCount;
+	uint InstanceCount;
 } u_PC;
 
 // -- RNG: same PCG hash as Utils::PCG_Hash / RandomFloat in Renderer.cpp --
@@ -121,8 +167,11 @@ vec3 SkyRadiance(vec3 direction)
 struct HitPayload {
 	float HitDistance;
 	vec3 WorldPosition;
-	vec3 WorldNormal;
+	vec3 WorldNormal;     // shading normal, on the same side as GeometricNormal
+	vec3 GeometricNormal;
+	int ObjectType;
 	int ObjectIndex;
+	int MaterialIndex;
 };
 
 HitPayload Miss()
@@ -131,63 +180,116 @@ HitPayload Miss()
 	payload.HitDistance = -0.1;
 	payload.WorldPosition = vec3(0.0);
 	payload.WorldNormal = vec3(0.0);
+	payload.GeometricNormal = vec3(0.0);
+	payload.ObjectType = OBJECT_NONE;
 	payload.ObjectIndex = -1;
+	payload.MaterialIndex = 0;
 	return payload;
 }
 
-HitPayload ClosestHit(vec3 rayOrigin, vec3 rayDirection, float hitDistance, int objectIndex)
+HitPayload ClosestHit(vec3 rayOrigin, vec3 rayDirection, float hitDistance, int objectType, int objectIndex, uint triangle, vec2 barycentrics)
 {
 	HitPayload payload;
 	payload.HitDistance = hitDistance;
+	payload.ObjectType = objectType;
 	payload.ObjectIndex = objectIndex;
+	payload.WorldPosition = rayOrigin + rayDirection * hitDistance;
 
-	vec3 spherePosition = Spheres[objectIndex].PositionAndRadius.xyz;
+	if (objectType == OBJECT_SPHERE)
+	{
+		payload.MaterialIndex = Spheres[objectIndex].MaterialIndex.x;
+		payload.WorldNormal = normalize(payload.WorldPosition - Spheres[objectIndex].PositionAndRadius.xyz);
+		payload.GeometricNormal = payload.WorldNormal;
+	}
+	else if (objectType == OBJECT_PLANE)
+	{
+		payload.MaterialIndex = Planes[objectIndex].MaterialIndex.x;
+		payload.WorldNormal = Planes[objectIndex].Normal.xyz;
+		payload.GeometricNormal = payload.WorldNormal;
+	}
+	else
+	{
+		payload.MaterialIndex = int(Instances[objectIndex].Info.z);
+		Vertex a = Vertices[Indices[triangle * 3u + 0u]];
+		Vertex b = Vertices[Indices[triangle * 3u + 1u]];
+		Vertex c = Vertices[Indices[triangle * 3u + 2u]];
 
-	vec3 origin = rayOrigin - spherePosition;
-	payload.WorldPosition = origin + rayDirection * hitDistance;
-	payload.WorldNormal = normalize(payload.WorldPosition);
-
-	payload.WorldPosition += spherePosition;
+		// Normals go object -> world with the inverse transpose: n * WorldToObject (as a row vector)
+		mat3 worldToObject = mat3(Instances[objectIndex].WorldToObject);
+		vec3 shading = (1.0 - barycentrics.x - barycentrics.y) * a.Normal.xyz + barycentrics.x * b.Normal.xyz + barycentrics.y * c.Normal.xyz;
+		payload.WorldNormal = normalize(shading * worldToObject);
+		payload.GeometricNormal = normalize(cross(b.Position.xyz - a.Position.xyz, c.Position.xyz - a.Position.xyz) * worldToObject);
+		if (dot(payload.GeometricNormal, payload.WorldNormal) < 0.0)
+			payload.GeometricNormal = -payload.GeometricNormal;
+	}
 
 	return payload;
 }
 
 HitPayload TraceRay(vec3 rayOrigin, vec3 rayDirection)
 {
-	int closestSphere = -1;
-	float hitDistance = 3.402823466e+38; // FLT_MAX
+	float hitDistance = FLT_MAX;
+	int hitType = OBJECT_NONE;
+	int hitIndex = -1;
+	uint hitTriangle = 0u;
+	vec2 hitBarycentrics = vec2(0.0);
 
 	for (uint i = 0u; i < u_PC.SphereCount; i++)
 	{
-		vec3 spherePosition = Spheres[i].PositionAndRadius.xyz;
-		float radius = Spheres[i].PositionAndRadius.w;
-
-		vec3 origin = rayOrigin - spherePosition;
-
-		float a = dot(rayDirection, rayDirection);
-		float b = 2.0 * dot(origin, rayDirection);
-		float c = dot(origin, origin) - radius * radius;
-
-		float discriminant = b * b - 4.0 * a * c;
-		if (discriminant < 0.0)
-			continue;
-
-		// Near hit, or the far one if the ray starts inside the sphere
-		float sqrtDiscriminant = sqrt(discriminant);
-		float closestT = (-b - sqrtDiscriminant) / (2.0 * a);
-		if (closestT <= 0.0)
-			closestT = (-b + sqrtDiscriminant) / (2.0 * a);
-		if (closestT > 0.0 && closestT < hitDistance)
+		float t = IntersectSphere(rayOrigin, rayDirection, Spheres[i].PositionAndRadius.xyz, Spheres[i].PositionAndRadius.w);
+		if (t > 0.0 && t < hitDistance)
 		{
-			hitDistance = closestT;
-			closestSphere = int(i);
+			hitDistance = t;
+			hitType = OBJECT_SPHERE;
+			hitIndex = int(i);
 		}
 	}
 
-	if (closestSphere < 0)
+	for (uint i = 0u; i < u_PC.PlaneCount; i++)
+	{
+		float t = IntersectPlane(rayOrigin, rayDirection, Planes[i].Point.xyz, Planes[i].Normal.xyz);
+		if (t > 0.0 && t < hitDistance)
+		{
+			hitDistance = t;
+			hitType = OBJECT_PLANE;
+			hitIndex = int(i);
+		}
+	}
+
+	for (uint i = 0u; i < u_PC.InstanceCount; i++)
+	{
+		// Object space; the direction isn't renormalized, so distances stay comparable with world space
+		vec3 origin = vec3(Instances[i].WorldToObject * vec4(rayOrigin, 1.0));
+		vec3 direction = mat3(Instances[i].WorldToObject) * rayDirection;
+
+		const vec3 padding = vec3(1e-4); // flat meshes (quads) have zero-thickness bounds
+		if (IntersectAABB(origin, 1.0 / direction, Instances[i].BoundsMin.xyz - padding, Instances[i].BoundsMax.xyz + padding, hitDistance) < 0.0)
+			continue;
+
+		uint firstTriangle = Instances[i].Info.x;
+		uint triangleCount = Instances[i].Info.y;
+		for (uint triangle = firstTriangle; triangle < firstTriangle + triangleCount; triangle++)
+		{
+			vec3 v0 = Vertices[Indices[triangle * 3u + 0u]].Position.xyz;
+			vec3 v1 = Vertices[Indices[triangle * 3u + 1u]].Position.xyz;
+			vec3 v2 = Vertices[Indices[triangle * 3u + 2u]].Position.xyz;
+			vec2 barycentrics;
+			float t = IntersectTriangle(origin, direction, v0, v1, v2, barycentrics);
+			if (t > 0.0 && t < hitDistance)
+			{
+				hitDistance = t;
+				hitType = OBJECT_MESH_INSTANCE;
+				hitIndex = int(i);
+				hitTriangle = triangle;
+				hitBarycentrics = barycentrics;
+			}
+		}
+	}
+
+	if (hitType == OBJECT_NONE)
 		return Miss();
 
-	return ClosestHit(rayOrigin, rayDirection, hitDistance, closestSphere);
+	return ClosestHit(rayOrigin, rayDirection, hitDistance, hitType, hitIndex, hitTriangle, hitBarycentrics);
 }
 
 vec3 PerPixel(uvec2 pixelCoord, uint sampleIndex)
@@ -240,7 +342,7 @@ vec3 PerPixel(uvec2 pixelCoord, uint sampleIndex)
 			break;
 		}
 
-		int materialIndex = Spheres[payload.ObjectIndex].MaterialIndex.x;
+		int materialIndex = payload.MaterialIndex;
 		SurfaceMaterial material;
 		material.Albedo = Materials[materialIndex].AlbedoRoughness.rgb;
 		material.Roughness = Materials[materialIndex].AlbedoRoughness.w;
@@ -253,10 +355,13 @@ vec3 PerPixel(uvec2 pixelCoord, uint sampleIndex)
 		// Emission is weighted by the throughput accumulated *before* this surface scatters the path
 		light += emissionColor * emissionPower * contribution;
 
-		// Shade with the normal facing the incoming ray (a ray can hit a surface from behind, e.g. from inside glass)
+		// Shade with the normals facing the incoming ray (a ray can hit a surface from behind, e.g. from inside glass)
 		vec3 wo = -rayDirection;
-		bool frontFace = dot(payload.WorldNormal, wo) >= 0.0;
+		bool frontFace = dot(payload.GeometricNormal, wo) >= 0.0;
+		vec3 geometricNormal = frontFace ? payload.GeometricNormal : -payload.GeometricNormal;
 		vec3 normal = frontFace ? payload.WorldNormal : -payload.WorldNormal;
+		if (dot(normal, wo) <= 0.0)
+			normal = geometricNormal;
 
 		vec3 u;
 		u.x = RandomFloat(seed);
@@ -266,10 +371,14 @@ vec3 PerPixel(uvec2 pixelCoord, uint sampleIndex)
 		BSDFSample bsdfSample;
 		if (!SampleBSDF(material, normal, wo, frontFace, u, bsdfSample))
 			break;
+		// A reflection that dips below the actual surface would leak light
+		bool leavesAbove = dot(bsdfSample.Direction, geometricNormal) > 0.0;
+		if (!bsdfSample.Delta && !leavesAbove)
+			break;
 		contribution *= bsdfSample.Weight;
 
 		// Nudge the origin off the surface, to whichever side the new ray leaves on
-		rayOrigin = payload.WorldPosition + normal * (dot(bsdfSample.Direction, normal) > 0.0 ? 0.0001 : -0.0001);
+		rayOrigin = payload.WorldPosition + geometricNormal * (leavesAbove ? 0.0001 : -0.0001);
 		rayDirection = bsdfSample.Direction;
 
 		// Russian roulette (same as Renderer::PerPixel)

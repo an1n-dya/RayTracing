@@ -1,8 +1,10 @@
 #include "SceneSerializer.h"
 
 #include "Json.h"
+#include "MeshLoader.h"
 
 #include <algorithm>
+#include <filesystem>
 
 namespace SceneSerializer {
 
@@ -35,7 +37,26 @@ namespace SceneSerializer {
 		return SkyMode::None;
 	}
 
+	// Mesh files are stored relative to the scene file when possible, so scene folders can be moved around
+	static std::string MakeRelative(const std::string& source, const std::filesystem::path& sceneDirectory) {
+		if (BuiltinMeshes::IsBuiltin(source))
+			return source;
+		std::error_code ec;
+		std::filesystem::path relative = std::filesystem::relative(source, sceneDirectory, ec);
+		if (ec || relative.empty())
+			return source;
+		return relative.generic_string();
+	}
+
+	static std::string Resolve(const std::string& source, const std::filesystem::path& sceneDirectory) {
+		if (BuiltinMeshes::IsBuiltin(source) || std::filesystem::path(source).is_absolute())
+			return source;
+		return (sceneDirectory / source).lexically_normal().string();
+	}
+
 	bool Save(const std::string& path, const Scene& scene, const Camera& camera, std::string* error) {
+		std::filesystem::path sceneDirectory = std::filesystem::absolute(path).parent_path();
+
 		Json::Value root = Json::Value::MakeObject();
 		root["version"] = FormatVersion;
 
@@ -72,6 +93,31 @@ namespace SceneSerializer {
 			json["position"] = ToJson(sphere.Position);
 			json["radius"] = sphere.Radius;
 			json["material"] = sphere.MaterialIndex;
+		}
+
+		Json::Value& planes = root["planes"] = Json::Value::MakeArray();
+		for (const Plane& plane : scene.Planes) {
+			Json::Value& json = planes.Append(Json::Value::MakeObject());
+			json["point"] = ToJson(plane.Point);
+			json["normal"] = ToJson(plane.Normal);
+			json["material"] = plane.MaterialIndex;
+		}
+
+		Json::Value& meshes = root["meshes"] = Json::Value::MakeArray();
+		for (const Mesh& mesh : scene.Meshes) {
+			Json::Value& json = meshes.Append(Json::Value::MakeObject());
+			json["name"] = mesh.Name;
+			json["source"] = MakeRelative(mesh.Source, sceneDirectory);
+		}
+
+		Json::Value& instances = root["meshInstances"] = Json::Value::MakeArray();
+		for (const MeshInstance& instance : scene.MeshInstances) {
+			Json::Value& json = instances.Append(Json::Value::MakeObject());
+			json["mesh"] = instance.MeshIndex;
+			json["position"] = ToJson(instance.Transform.Translation);
+			json["rotation"] = ToJson(instance.Transform.Rotation);
+			json["scale"] = ToJson(instance.Transform.Scale);
+			json["material"] = instance.MaterialIndex;
 		}
 
 		return Json::WriteFile(path, root, error);
@@ -124,6 +170,42 @@ namespace SceneSerializer {
 			sphere.MaterialIndex = std::clamp(json["material"].AsInt(0), 0, maxMaterial);
 			loaded.Spheres.push_back(sphere);
 		}
+
+		for (const Json::Value& json : root["planes"].Elements()) {
+			Plane plane;
+			plane.Point = ReadVec3(json["point"], plane.Point);
+			glm::vec3 normal = ReadVec3(json["normal"], plane.Normal);
+			plane.Normal = glm::dot(normal, normal) > 0.0f ? glm::normalize(normal) : glm::vec3(0, 1, 0);
+			plane.MaterialIndex = std::clamp(json["material"].AsInt(0), 0, maxMaterial);
+			loaded.Planes.push_back(plane);
+		}
+
+		std::filesystem::path sceneDirectory = std::filesystem::absolute(path).parent_path();
+		for (const Json::Value& json : root["meshes"].Elements()) {
+			Mesh mesh;
+			std::string meshError;
+			if (!MeshLoader::Load(Resolve(json["source"].AsString(), sceneDirectory), mesh, &meshError)) {
+				if (error)
+					*error = path + ": " + meshError;
+				return false;
+			}
+			mesh.Name = json["name"].AsString(mesh.Name);
+			loaded.Meshes.push_back(std::move(mesh));
+		}
+
+		int maxMesh = (int)loaded.Meshes.size() - 1;
+		for (const Json::Value& json : root["meshInstances"].Elements()) {
+			if (maxMesh < 0)
+				break;
+			MeshInstance instance;
+			instance.MeshIndex = std::clamp(json["mesh"].AsInt(0), 0, maxMesh);
+			instance.Transform.Translation = ReadVec3(json["position"], instance.Transform.Translation);
+			instance.Transform.Rotation = ReadVec3(json["rotation"], instance.Transform.Rotation);
+			instance.Transform.Scale = ReadVec3(json["scale"], instance.Transform.Scale);
+			instance.MaterialIndex = std::clamp(json["material"].AsInt(0), 0, maxMaterial);
+			loaded.MeshInstances.push_back(instance);
+		}
+		loaded.MarkGeometryChanged();
 
 		const Json::Value& cameraJson = root["camera"];
 		if (cameraJson.IsObject()) {

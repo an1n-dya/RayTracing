@@ -49,9 +49,18 @@ private:
 	struct HitPayload {
 		float HitDistance;
 		glm::vec3 WorldPosition;
-		glm::vec3 WorldNormal;
+		glm::vec3 WorldNormal;     // shading normal (interpolated for meshes), on the same side as GeometricNormal
+		glm::vec3 GeometricNormal; // true surface normal, used for offsets and deciding which side was hit
 
-		int ObjectIndex;
+		ObjectRef Object;
+		int MaterialIndex;
+	};
+
+	// Per-frame data derived from the scene (instance matrices)
+	struct InstanceData {
+		glm::mat4 ObjectToWorld;
+		glm::mat4 WorldToObject;
+		glm::mat3 NormalMatrix; // object -> world for normals
 	};
 
 	glm::vec4 PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex); // RayGen
@@ -59,8 +68,9 @@ private:
 	// Dispatch to the fast PCG hash or Walnut::Random depending on Settings.SlowRandom
 	float RandomFloat(uint32_t& seed) const;
 
+	void PrepareScene(const Scene& scene);
 	HitPayload TraceRay(const Ray& ray);
-	HitPayload ClosestHit(const Ray& ray, float hitDistance, int objectIndex);
+	HitPayload ClosestHit(const Ray& ray, float hitDistance, const ObjectRef& object, uint32_t triangle, const glm::vec2& barycentrics);
 	HitPayload Miss(const Ray& ray);
 
 	void RenderCPU(const FrameParams& frame);
@@ -74,6 +84,7 @@ private:
 
 	const Scene* m_ActiveScene = nullptr;
 	const Camera* m_ActiveCamera = nullptr;
+	std::vector<InstanceData> m_Instances; // parallel to m_ActiveScene->MeshInstances
 
 	uint32_t* m_ImageData = nullptr;
 	glm::vec4* m_AccumulationData = nullptr;

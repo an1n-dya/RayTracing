@@ -51,6 +51,7 @@ private:
 	};
 
 	void Init();
+	void UploadGeometry(const Scene& scene);
 	void CreateImages(uint32_t width, uint32_t height);
 	void ReleaseImages();
 
@@ -78,6 +79,15 @@ private:
 	Buffer m_FrameBuffer; // UBO: camera + environment
 	Buffer m_SphereBuffer;
 	Buffer m_MaterialBuffer;
+	Buffer m_PlaneBuffer;
+	Buffer m_InstanceBuffer;
+
+	// Mesh geometry, only re-uploaded when Scene::GeometryVersion changes
+	Buffer m_VertexBuffer;
+	Buffer m_IndexBuffer;
+	bool m_GeometryUploaded = false;
+	uint64_t m_UploadedGeometryVersion = 0;
+	std::vector<uint32_t> m_MeshFirstTriangle; // per mesh, into the concatenated index buffer
 
 	// Per-resize resources
 	StorageImage m_AccumulationImage; // rgba32f: rgb = radiance sum, a = sample count

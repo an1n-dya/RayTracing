@@ -22,6 +22,10 @@ namespace {
 			Materials = 2,         // SSBO
 			AccumulationImage = 3, // storage image, rgba32f
 			DisplayImage = 4,      // storage image, rgba8
+			Planes = 5,            // SSBO
+			Instances = 6,         // SSBO: mesh instances
+			Vertices = 7,          // SSBO: all meshes' vertices
+			Indices = 8,           // SSBO: all meshes' triangles (global vertex indices)
 			Count
 		};
 	}
@@ -32,6 +36,10 @@ namespace {
 		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 		VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
 		VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 	};
 
 	// Mirrors the std430/std140 layouts declared in PathTrace.comp
@@ -44,6 +52,25 @@ namespace {
 		glm::vec4 AlbedoRoughness;  // rgb = albedo, w = roughness
 		glm::vec4 EmissionAndPower; // rgb = emission color, w = emission power
 		glm::vec4 MetallicTransmissionIOR; // x = metallic, y = transmission, z = IOR
+	};
+
+	struct PlaneGPU {
+		glm::vec4 Point;
+		glm::vec4 Normal;
+		glm::ivec4 MaterialIndex; // x
+	};
+
+	struct InstanceGPU {
+		glm::mat4 ObjectToWorld;
+		glm::mat4 WorldToObject;
+		glm::vec4 BoundsMin; // object space
+		glm::vec4 BoundsMax;
+		glm::uvec4 Info;     // x = first triangle, y = triangle count, z = material index
+	};
+
+	struct VertexGPU {
+		glm::vec4 Position;
+		glm::vec4 Normal;
 	};
 
 	struct FrameUBOData {
@@ -72,6 +99,8 @@ namespace {
 		uint32_t SRGBOutput;
 		uint32_t AntiAliasing;
 		uint32_t ResetAccumulation;
+		uint32_t PlaneCount;
+		uint32_t InstanceCount;
 	};
 
 	uint32_t FindMemoryType(VkMemoryPropertyFlags properties, uint32_t typeBits)
@@ -213,7 +242,8 @@ GpuPathTracer::~GpuPathTracer()
 	if (m_AccumulationImage.Image != VK_NULL_HANDLE)
 		ReleaseImages();
 
-	std::vector<Buffer> buffers = { m_FrameBuffer, m_SphereBuffer, m_MaterialBuffer };
+	std::vector<Buffer> buffers = { m_FrameBuffer, m_SphereBuffer, m_MaterialBuffer, m_PlaneBuffer, m_InstanceBuffer,
+		m_VertexBuffer, m_IndexBuffer };
 
 	Walnut::Application::SubmitResourceFree([shaderModule = m_ShaderModule, pipeline = m_Pipeline,
 		pipelineLayout = m_PipelineLayout, descriptorSetLayout = m_DescriptorSetLayout, descriptorPool = m_DescriptorPool,
@@ -313,6 +343,32 @@ void GpuPathTracer::Init()
 	check_vk_result(err);
 
 	m_Initialized = true;
+}
+
+void GpuPathTracer::UploadGeometry(const Scene& scene)
+{
+	if (m_GeometryUploaded && m_UploadedGeometryVersion == scene.GeometryVersion)
+		return;
+
+	std::vector<VertexGPU> vertices;
+	std::vector<uint32_t> indices;
+	m_MeshFirstTriangle.clear();
+	for (const Mesh& mesh : scene.Meshes)
+	{
+		uint32_t vertexOffset = (uint32_t)vertices.size();
+		m_MeshFirstTriangle.push_back((uint32_t)(indices.size() / 3));
+
+		for (const Vertex& vertex : mesh.Vertices)
+			vertices.push_back({ glm::vec4(vertex.Position, 1.0f), glm::vec4(vertex.Normal, 0.0f) });
+		for (uint32_t index : mesh.Indices)
+			indices.push_back(vertexOffset + index);
+	}
+
+	Upload(m_VertexBuffer, Binding::Vertices, BindingTypes[Binding::Vertices], vertices.data(), vertices.size() * sizeof(VertexGPU));
+	Upload(m_IndexBuffer, Binding::Indices, BindingTypes[Binding::Indices], indices.data(), indices.size() * sizeof(uint32_t));
+
+	m_GeometryUploaded = true;
+	m_UploadedGeometryVersion = scene.GeometryVersion;
 }
 
 void GpuPathTracer::Upload(Buffer& buffer, uint32_t binding, VkDescriptorType type, const void* data, VkDeviceSize size)
@@ -564,6 +620,30 @@ void GpuPathTracer::Render(const Scene& scene, const Camera& camera, const Rende
 	}
 	Upload(m_MaterialBuffer, Binding::Materials, BindingTypes[Binding::Materials], materials.data(), materials.size() * sizeof(MaterialGPU));
 
+	std::vector<PlaneGPU> planes(scene.Planes.size());
+	for (size_t i = 0; i < planes.size(); i++)
+	{
+		planes[i].Point = glm::vec4(scene.Planes[i].Point, 1.0f);
+		planes[i].Normal = glm::vec4(scene.Planes[i].Normal, 0.0f);
+		planes[i].MaterialIndex = glm::ivec4(scene.Planes[i].MaterialIndex, 0, 0, 0);
+	}
+	Upload(m_PlaneBuffer, Binding::Planes, BindingTypes[Binding::Planes], planes.data(), planes.size() * sizeof(PlaneGPU));
+
+	UploadGeometry(scene);
+
+	std::vector<InstanceGPU> instances(scene.MeshInstances.size());
+	for (size_t i = 0; i < instances.size(); i++)
+	{
+		const MeshInstance& instance = scene.MeshInstances[i];
+		const Mesh& mesh = scene.Meshes[instance.MeshIndex];
+		instances[i].ObjectToWorld = instance.Transform.GetMatrix();
+		instances[i].WorldToObject = glm::inverse(instances[i].ObjectToWorld);
+		instances[i].BoundsMin = glm::vec4(mesh.BoundsMin, 0.0f);
+		instances[i].BoundsMax = glm::vec4(mesh.BoundsMax, 0.0f);
+		instances[i].Info = glm::uvec4(m_MeshFirstTriangle[instance.MeshIndex], mesh.GetTriangleCount(), (uint32_t)instance.MaterialIndex, 0u);
+	}
+	Upload(m_InstanceBuffer, Binding::Instances, BindingTypes[Binding::Instances], instances.data(), instances.size() * sizeof(InstanceGPU));
+
 	PushConstants pushConstants{};
 	pushConstants.Width = m_Width;
 	pushConstants.Height = m_Height;
@@ -578,6 +658,8 @@ void GpuPathTracer::Render(const Scene& scene, const Camera& camera, const Rende
 	pushConstants.ToneMapper = (uint32_t)settings.ToneMapping;
 	pushConstants.SRGBOutput = settings.SRGBOutput ? 1u : 0u;
 	pushConstants.AntiAliasing = settings.AntiAliasing ? 1u : 0u;
+	pushConstants.PlaneCount = (uint32_t)planes.size();
+	pushConstants.InstanceCount = (uint32_t)instances.size();
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 

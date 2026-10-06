@@ -2,6 +2,7 @@
 
 #include "BSDF.h"
 #include "ImageExport.h"
+#include "Intersection.h"
 #include "ToneMapping.h"
 
 #include "Walnut/Random.h"
@@ -85,7 +86,7 @@ bool Renderer::Render(const Scene& scene, const Camera& camera) {
 	if (!m_FinalImage || !m_ImageData)
 		return false;
 
-	m_ActiveScene = &scene;
+	PrepareScene(scene);
 	m_ActiveCamera = &camera;
 
 	if (m_FrameIndex == 1)
@@ -148,16 +149,19 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex) {
 			break;
 		}
 
-		const Sphere& sphere = m_ActiveScene->Spheres[payload.ObjectIndex];
-		const Material& material = m_ActiveScene->Materials[sphere.MaterialIndex];
+		const Material& material = m_ActiveScene->Materials[payload.MaterialIndex];
 
 		// Emission is weighted by the throughput accumulated *before* this surface scatters the path
 		light += material.GetEmission() * contribution;
 
-		// Shade with the normal facing the incoming ray (a ray can hit a surface from behind, e.g. from inside glass)
+		// Shade with the normals facing the incoming ray (a ray can hit a surface from behind, e.g. from inside glass)
 		glm::vec3 wo = -ray.Direction;
-		bool frontFace = glm::dot(payload.WorldNormal, wo) >= 0.0f;
+		bool frontFace = glm::dot(payload.GeometricNormal, wo) >= 0.0f;
+		glm::vec3 geometricNormal = frontFace ? payload.GeometricNormal : -payload.GeometricNormal;
 		glm::vec3 normal = frontFace ? payload.WorldNormal : -payload.WorldNormal;
+		// Interpolated normals can face away from the viewer near silhouettes: use the true one there
+		if (glm::dot(normal, wo) <= 0.0f)
+			normal = geometricNormal;
 
 		// Draw the random numbers one at a time so the order matches the GPU path
 		glm::vec3 u;
@@ -168,10 +172,14 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex) {
 		BSDF::Sample bsdfSample;
 		if (!BSDF::SampleDirection(material, normal, wo, frontFace, u, bsdfSample))
 			break;
+		// A reflection that dips below the actual surface (possible with interpolated normals) would leak light
+		bool leavesAbove = glm::dot(bsdfSample.Direction, geometricNormal) > 0.0f;
+		if (!bsdfSample.Delta && !leavesAbove)
+			break;
 		contribution *= bsdfSample.Weight;
 
 		// Nudge the origin off the surface, to whichever side the new ray leaves on (transmission goes through)
-		ray.Origin = payload.WorldPosition + normal * (glm::dot(bsdfSample.Direction, normal) > 0.0f ? 0.0001f : -0.0001f);
+		ray.Origin = payload.WorldPosition + geometricNormal * (leavesAbove ? 0.0001f : -0.0001f);
 		ray.Direction = bsdfSample.Direction;
 
 		// Russian roulette: randomly end paths that can't carry much more light, boosting the
@@ -193,64 +201,111 @@ float Renderer::RandomFloat(uint32_t& seed) const {
 	return Utils::RandomFloat(seed);
 }
 
+void Renderer::PrepareScene(const Scene& scene) {
+	m_ActiveScene = &scene;
+
+	m_Instances.resize(scene.MeshInstances.size());
+	for (size_t i = 0; i < scene.MeshInstances.size(); i++) {
+		InstanceData& instance = m_Instances[i];
+		instance.ObjectToWorld = scene.MeshInstances[i].Transform.GetMatrix();
+		instance.WorldToObject = glm::inverse(instance.ObjectToWorld);
+		instance.NormalMatrix = glm::transpose(glm::mat3(instance.WorldToObject));
+	}
+}
+
 Renderer::HitPayload Renderer::TraceRay(const Ray& ray) {
-	// Equation of a sphere:
-	// (bx^2 + by^2)t^2 + (2(axbx + ayby))t + (ax^2 + ay^2 - r^2) = 0
-	// where:
-	// a = ray origin	
-	// b = ray direction
-	// r = radius
-	// t = hit distance	
+	const Scene& scene = *m_ActiveScene;
 
-	int closestSphere = -1;
 	float hitDistance = std::numeric_limits<float>::max();
+	ObjectRef hitObject;
+	uint32_t hitTriangle = 0;
+	glm::vec2 hitBarycentrics(0.0f);
 
-	for (size_t i = 0; i < m_ActiveScene->Spheres.size(); i++) {
-		const Sphere& sphere = m_ActiveScene->Spheres[i];
-		glm::vec3 origin = ray.Origin - sphere.Position;
-
-		float a = glm::dot(ray.Direction, ray.Direction);
-		float b = 2.0f * glm::dot(origin, ray.Direction);
-		float c = glm::dot(origin, origin) - sphere.Radius * sphere.Radius;
-
-		// Quadratic formula discriminant:
-		// discriminant = b^2 - 4ac
-		float discriminant = b * b - 4.0f * a * c;
-		if (discriminant < 0.0f)
-			continue;
-
-		// Solve for t using the quadratic formula:
-		// t = (-b +- sqrt(discriminant)) / 2a
-		
-		// Take the near hit, or the far one if the ray starts inside the sphere (e.g. after refracting into glass)
-		float sqrtDiscriminant = glm::sqrt(discriminant);
-		float closestT = (-b - sqrtDiscriminant) / (2.0f * a);
-		if (closestT <= 0.0f)
-			closestT = (-b + sqrtDiscriminant) / (2.0f * a);
-		if (closestT > 0.0f && closestT < hitDistance) {
-			hitDistance = closestT;
-			closestSphere = (int)i;
+	for (size_t i = 0; i < scene.Spheres.size(); i++) {
+		float t = Intersect::Sphere(ray.Origin, ray.Direction, scene.Spheres[i].Position, scene.Spheres[i].Radius);
+		if (t > 0.0f && t < hitDistance) {
+			hitDistance = t;
+			hitObject = { ObjectType::Sphere, (int)i };
 		}
 	}
 
-	if (closestSphere < 0)
+	for (size_t i = 0; i < scene.Planes.size(); i++) {
+		float t = Intersect::Plane(ray.Origin, ray.Direction, scene.Planes[i].Point, scene.Planes[i].Normal);
+		if (t > 0.0f && t < hitDistance) {
+			hitDistance = t;
+			hitObject = { ObjectType::Plane, (int)i };
+		}
+	}
+
+	for (size_t i = 0; i < scene.MeshInstances.size(); i++) {
+		const Mesh& mesh = scene.Meshes[scene.MeshInstances[i].MeshIndex];
+		const InstanceData& instance = m_Instances[i];
+
+		// Intersect in object space. The direction isn't renormalized, so distances stay comparable with world space.
+		glm::vec3 origin = glm::vec3(instance.WorldToObject * glm::vec4(ray.Origin, 1.0f));
+		glm::vec3 direction = glm::mat3(instance.WorldToObject) * ray.Direction;
+
+		const glm::vec3 padding(1e-4f); // flat meshes (quads) have zero-thickness bounds
+		if (Intersect::AABB(origin, 1.0f / direction, mesh.BoundsMin - padding, mesh.BoundsMax + padding, hitDistance) < 0.0f)
+			continue;
+
+		for (uint32_t triangle = 0; triangle < mesh.GetTriangleCount(); triangle++) {
+			const glm::vec3& v0 = mesh.Vertices[mesh.Indices[triangle * 3 + 0]].Position;
+			const glm::vec3& v1 = mesh.Vertices[mesh.Indices[triangle * 3 + 1]].Position;
+			const glm::vec3& v2 = mesh.Vertices[mesh.Indices[triangle * 3 + 2]].Position;
+			glm::vec2 barycentrics;
+			float t = Intersect::Triangle(origin, direction, v0, v1, v2, barycentrics);
+			if (t > 0.0f && t < hitDistance) {
+				hitDistance = t;
+				hitObject = { ObjectType::MeshInstance, (int)i };
+				hitTriangle = triangle;
+				hitBarycentrics = barycentrics;
+			}
+		}
+	}
+
+	if (!hitObject.IsValid())
 		return Miss(ray);
 
-	return ClosestHit(ray, hitDistance,	closestSphere);
+	return ClosestHit(ray, hitDistance, hitObject, hitTriangle, hitBarycentrics);
 }
 
-Renderer::HitPayload Renderer::ClosestHit(const Ray& ray, float hitDistance, int objectIndex) {
+Renderer::HitPayload Renderer::ClosestHit(const Ray& ray, float hitDistance, const ObjectRef& object, uint32_t triangle, const glm::vec2& barycentrics) {
+	const Scene& scene = *m_ActiveScene;
+
 	Renderer::HitPayload payload;
 	payload.HitDistance = hitDistance;
-	payload.ObjectIndex = objectIndex;
+	payload.Object = object;
+	payload.MaterialIndex = scene.GetMaterialIndex(object);
+	payload.WorldPosition = ray.Origin + ray.Direction * hitDistance;
 
-	const Sphere& closestSphere = m_ActiveScene->Spheres[objectIndex];
+	switch (object.Type) {
+	case ObjectType::Sphere:
+		payload.WorldNormal = glm::normalize(payload.WorldPosition - scene.Spheres[object.Index].Position);
+		payload.GeometricNormal = payload.WorldNormal;
+		break;
+	case ObjectType::Plane:
+		payload.WorldNormal = scene.Planes[object.Index].Normal;
+		payload.GeometricNormal = payload.WorldNormal;
+		break;
+	case ObjectType::MeshInstance: {
+		const Mesh& mesh = scene.Meshes[scene.MeshInstances[object.Index].MeshIndex];
+		const InstanceData& instance = m_Instances[object.Index];
+		const Vertex& a = mesh.Vertices[mesh.Indices[triangle * 3 + 0]];
+		const Vertex& b = mesh.Vertices[mesh.Indices[triangle * 3 + 1]];
+		const Vertex& c = mesh.Vertices[mesh.Indices[triangle * 3 + 2]];
 
-	glm::vec3 origin = ray.Origin - closestSphere.Position;
-	payload.WorldPosition = origin + ray.Direction * hitDistance;
-	payload.WorldNormal = glm::normalize(payload.WorldPosition);
-
-	payload.WorldPosition += closestSphere.Position;
+		glm::vec3 shading = (1.0f - barycentrics.x - barycentrics.y) * a.Normal + barycentrics.x * b.Normal + barycentrics.y * c.Normal;
+		payload.WorldNormal = glm::normalize(instance.NormalMatrix * shading);
+		payload.GeometricNormal = glm::normalize(instance.NormalMatrix * glm::cross(b.Position - a.Position, c.Position - a.Position));
+		// Trust the authored normals about which side is the outside (winding in files isn't always consistent)
+		if (glm::dot(payload.GeometricNormal, payload.WorldNormal) < 0.0f)
+			payload.GeometricNormal = -payload.GeometricNormal;
+		break;
+	}
+	default:
+		break;
+	}
 
 	return payload;
 }
@@ -315,7 +370,7 @@ void Renderer::UpdateDifferenceImage() {
 }
 
 ObjectRef Renderer::Pick(const Scene& scene, const Camera& camera, const glm::vec2& ndc, float* outDistance) {
-	m_ActiveScene = &scene;
+	PrepareScene(scene);
 
 	Ray ray;
 	ray.Origin = camera.GetPosition();
@@ -327,7 +382,7 @@ ObjectRef Renderer::Pick(const Scene& scene, const Camera& camera, const glm::ve
 
 	if (outDistance)
 		*outDistance = payload.HitDistance;
-	return { ObjectType::Sphere, payload.ObjectIndex };
+	return payload.Object;
 }
 
 bool Renderer::SaveImage(const std::string& path) {

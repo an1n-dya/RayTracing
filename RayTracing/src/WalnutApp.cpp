@@ -7,6 +7,7 @@
 #include "Renderer.h"
 #include "Camera.h"
 #include "FileDialogs.h"
+#include "MeshLoader.h"
 #include "SceneSerializer.h"
 
 #include "imgui_internal.h" // DockId lookup for default panel placement
@@ -407,13 +408,18 @@ private:
 	}
 
 	static std::string GetObjectLabel(const Scene& scene, const ObjectRef& object) {
-		char label[128];
+		const char* material = scene.Materials[scene.GetMaterialIndex(object)].Name.c_str();
+		char label[256];
 		switch (object.Type) {
-		case ObjectType::Sphere: {
-			const Sphere& sphere = scene.Spheres[object.Index];
-			snprintf(label, sizeof(label), "Sphere %d (%s)", object.Index, scene.Materials[sphere.MaterialIndex].Name.c_str());
+		case ObjectType::Sphere:
+			snprintf(label, sizeof(label), "Sphere %d (%s)", object.Index, material);
 			break;
-		}
+		case ObjectType::Plane:
+			snprintf(label, sizeof(label), "Plane %d (%s)", object.Index, material);
+			break;
+		case ObjectType::MeshInstance:
+			snprintf(label, sizeof(label), "%s %d (%s)", scene.Meshes[scene.MeshInstances[object.Index].MeshIndex].Name.c_str(), object.Index, material);
+			break;
 		default:
 			snprintf(label, sizeof(label), "?");
 			break;
@@ -421,23 +427,66 @@ private:
 		return label;
 	}
 
+	// Adds an instance of the mesh with this source, loading it first unless the scene already has it
+	void AddMeshInstance(const std::string& source) {
+		int meshIndex = m_Scene.FindMesh(source);
+		if (meshIndex < 0) {
+			Mesh mesh;
+			std::string error;
+			if (!MeshLoader::Load(source, mesh, &error)) {
+				ShowError("Couldn't load mesh:\n" + error);
+				return;
+			}
+			meshIndex = m_Scene.AddMesh(std::move(mesh));
+		}
+		m_Selection = m_Scene.AddMeshInstance(meshIndex);
+		m_SceneChanged = true;
+	}
+
 	// Scene panel: the object list plus the selected object's properties
 	void DrawScenePanel() {
 		ImGui::Begin("Scene");
 
-		if (ImGui::Button("Add Sphere")) {
-			m_Selection = m_Scene.AddSphere();
-			m_SceneChanged = true;
+		if (ImGui::Button("Add..."))
+			ImGui::OpenPopup("AddObject");
+		if (ImGui::BeginPopup("AddObject")) {
+			if (ImGui::MenuItem("Sphere")) {
+				m_Selection = m_Scene.AddSphere();
+				m_SceneChanged = true;
+			}
+			if (ImGui::MenuItem("Plane")) {
+				m_Selection = m_Scene.AddPlane();
+				m_SceneChanged = true;
+			}
+			ImGui::Separator();
+			if (ImGui::MenuItem("Box"))
+				AddMeshInstance(BuiltinMeshes::Box);
+			if (ImGui::MenuItem("Quad"))
+				AddMeshInstance(BuiltinMeshes::Quad);
+			if (ImGui::MenuItem("Sphere (mesh)"))
+				AddMeshInstance(BuiltinMeshes::Sphere);
+			ImGui::Separator();
+			if (ImGui::MenuItem("Mesh from file...")) {
+				std::string path = FileDialogs::OpenFile("Wavefront OBJ (*.obj)\0*.obj\0All files\0*.*\0");
+				if (!path.empty())
+					AddMeshInstance(path);
+			}
+			ImGui::EndPopup();
 		}
 
-		if (ImGui::BeginListBox("##Objects", ImVec2(-FLT_MIN, 8 * ImGui::GetTextLineHeightWithSpacing()))) {
-			for (int i = 0; i < (int)m_Scene.Spheres.size(); i++) {
-				ObjectRef object{ ObjectType::Sphere, i };
-				ImGui::PushID(i);
-				if (ImGui::Selectable(GetObjectLabel(m_Scene, object).c_str(), m_Selection == object))
-					m_Selection = object;
-				ImGui::PopID();
-			}
+		if (ImGui::BeginListBox("##Objects", ImVec2(-FLT_MIN, 10 * ImGui::GetTextLineHeightWithSpacing()))) {
+			auto listObjects = [this](ObjectType type, size_t count) {
+				for (int i = 0; i < (int)count; i++) {
+					ObjectRef object{ type, i };
+					ImGui::PushID((int)type * 1000003 + i);
+					if (ImGui::Selectable(GetObjectLabel(m_Scene, object).c_str(), m_Selection == object))
+						m_Selection = object;
+					ImGui::PopID();
+				}
+			};
+			listObjects(ObjectType::Sphere, m_Scene.Spheres.size());
+			listObjects(ObjectType::Plane, m_Scene.Planes.size());
+			listObjects(ObjectType::MeshInstance, m_Scene.MeshInstances.size());
 			ImGui::EndListBox();
 		}
 
@@ -456,6 +505,25 @@ private:
 					m_SceneChanged = true;
 				}
 				m_SceneChanged |= MaterialCombo("Material", sphere.MaterialIndex);
+			}
+			else if (m_Selection.Type == ObjectType::Plane) {
+				Plane& plane = m_Scene.Planes[m_Selection.Index];
+				m_SceneChanged |= ImGui::DragFloat3("Point", glm::value_ptr(plane.Point), 0.1f);
+				glm::vec3 normal = plane.Normal;
+				if (ImGui::DragFloat3("Normal", glm::value_ptr(normal), 0.01f, -1.0f, 1.0f) && glm::dot(normal, normal) > 1e-6f) {
+					plane.Normal = glm::normalize(normal);
+					m_SceneChanged = true;
+				}
+				m_SceneChanged |= MaterialCombo("Material", plane.MaterialIndex);
+			}
+			else if (m_Selection.Type == ObjectType::MeshInstance) {
+				MeshInstance& instance = m_Scene.MeshInstances[m_Selection.Index];
+				const Mesh& mesh = m_Scene.Meshes[instance.MeshIndex];
+				ImGui::TextDisabled("%s: %u triangles", mesh.Source.c_str(), mesh.GetTriangleCount());
+				m_SceneChanged |= ImGui::DragFloat3("Position", glm::value_ptr(instance.Transform.Translation), 0.05f);
+				m_SceneChanged |= ImGui::DragFloat3("Rotation", glm::value_ptr(instance.Transform.Rotation), 0.5f, -360.0f, 360.0f, "%.1f deg");
+				m_SceneChanged |= ImGui::DragFloat3("Scale", glm::value_ptr(instance.Transform.Scale), 0.01f, 0.001f, 1000.0f);
+				m_SceneChanged |= MaterialCombo("Material", instance.MaterialIndex);
 			}
 
 			if (ImGui::Button("Duplicate")) {
