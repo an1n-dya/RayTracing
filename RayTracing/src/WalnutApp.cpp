@@ -63,11 +63,22 @@ public:
 	virtual void OnUIRender() override {
 		ImGui::Begin("Settings");
 		ImGui::Text("Last render: %.3fms (%.1f FPS)", m_LastRenderTime, m_FPS);
+		if (m_Renderer.GetSettings().MaxSamples > 0)
+			ImGui::Text("Samples: %u / %d%s", m_Renderer.GetSampleCount(), m_Renderer.GetSettings().MaxSamples,
+				m_Renderer.IsConverged() ? " (done)" : "");
+		else
+			ImGui::Text("Samples: %u", m_Renderer.GetSampleCount());
 		if (ImGui::Button("Render"))
 			Render();
 
 		ImGui::Checkbox("Accumulate", &m_Renderer.GetSettings().Accumulate);
-		ImGui::Checkbox("Use GPU", &m_Renderer.GetSettings().UseGPU);
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
+		ImGui::DragInt("Max Samples", &m_Renderer.GetSettings().MaxSamples, 1.0f, 0, 1 << 20,
+			m_Renderer.GetSettings().MaxSamples > 0 ? "%d" : "unlimited");
+		// The CPU and GPU paths keep separate accumulation buffers, so restart when switching
+		if (ImGui::Checkbox("Use GPU", &m_Renderer.GetSettings().UseGPU))
+			m_Renderer.ResetFrameIndex();
 
 		ImGui::BeginDisabled(m_Renderer.GetSettings().UseGPU);
 		ImGui::Checkbox("Slow Random", &m_Renderer.GetSettings().SlowRandom);
@@ -178,8 +189,9 @@ public:
 
 		m_Renderer.OnResize(m_ViewportWidth, m_ViewportHeight);
 		m_Camera.OnResize(m_ViewportWidth, m_ViewportHeight);
-		m_Renderer.Render(m_Scene, m_Camera);
-	
+		if (!m_Renderer.Render(m_Scene, m_Camera))
+			return; // converged: keep showing the last frame's timings
+
 		m_LastRenderTime = timer.ElapsedMillis();
 		m_FPS = m_LastRenderTime > 0.0f ? 1000.0f / m_LastRenderTime : 0.0f;
 	}

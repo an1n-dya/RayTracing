@@ -18,13 +18,16 @@ public:
 	Renderer() = default;
 
 	void OnResize(uint32_t width, uint32_t height);
-	void Render(const Scene& scene, const Camera& camera);
+	// Returns false (and leaves the previous image in place) once Settings.MaxSamples is reached
+	bool Render(const Scene& scene, const Camera& camera);
 
 	VkDescriptorSet GetFinalImageDescriptorSet() const;
 	uint32_t GetFinalImageWidth() const;
 	uint32_t GetFinalImageHeight() const;
 
 	void ResetFrameIndex() { m_FrameIndex = 1; }
+	uint32_t GetSampleCount() const { return m_SampleCount; }
+	bool IsConverged() const;
 	Settings& GetSettings() { return m_Settings; }
 private:
 	struct HitPayload {
@@ -58,4 +61,5 @@ private:
 	glm::vec4* m_AccumulationData = nullptr;
 
 	uint32_t m_FrameIndex = 1;
+	uint32_t m_SampleCount = 0; // samples per pixel in the image currently displayed
 };

@@ -46,6 +46,9 @@ void Renderer::OnResize(uint32_t width, uint32_t height) {
 		m_FinalImage = std::make_shared<Walnut::Image>(width, height, Walnut::ImageFormat::RGBA);
 	}
 
+	// The (re)allocated accumulation buffers hold garbage until frame 1 clears them
+	m_FrameIndex = 1;
+
 	delete[] m_ImageData;
 	m_ImageData = new uint32_t[width * height];
 
@@ -60,9 +63,16 @@ void Renderer::OnResize(uint32_t width, uint32_t height) {
 		m_ImageVerticalIter[i] = i;
 }
 
-void Renderer::Render(const Scene& scene, const Camera& camera) {
+bool Renderer::IsConverged() const {
+	return m_Settings.Accumulate && m_Settings.MaxSamples > 0 && m_FrameIndex > (uint32_t)m_Settings.MaxSamples;
+}
+
+bool Renderer::Render(const Scene& scene, const Camera& camera) {
 	if (!m_FinalImage || !m_ImageData)
-		return;
+		return false;
+
+	if (IsConverged())
+		return false;
 
 	m_ActiveScene = &scene;
 	m_ActiveCamera = &camera;
@@ -108,10 +118,14 @@ void Renderer::Render(const Scene& scene, const Camera& camera) {
 		m_FinalImage->SetData(m_ImageData);
 	}
 
+	m_SampleCount = m_FrameIndex;
+
 	if (m_Settings.Accumulate)
 		m_FrameIndex++;
 	else
 		m_FrameIndex = 1;
+
+	return true;
 }
 
 glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y) {
