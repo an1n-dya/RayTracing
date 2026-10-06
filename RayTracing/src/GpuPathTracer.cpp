@@ -40,16 +40,17 @@ namespace {
 	struct PushConstants {
 		uint32_t Width;
 		uint32_t Height;
-		uint32_t FrameIndex;
+		uint32_t FirstSampleIndex;
 		uint32_t SphereCount;
 		uint32_t Bounces;
 		uint32_t RussianRoulette;
 		uint32_t RussianRouletteStartBounce;
-		uint32_t Trace;
+		uint32_t SampleCount;
 		float Exposure;
 		uint32_t ToneMapper;
 		uint32_t SRGBOutput;
 		uint32_t AntiAliasing;
+		uint32_t ResetAccumulation;
 	};
 
 	uint32_t FindMemoryType(VkMemoryPropertyFlags properties, uint32_t typeBits)
@@ -427,7 +428,7 @@ void GpuPathTracer::OnResize(uint32_t width, uint32_t height)
 	m_Height = height;
 }
 
-void GpuPathTracer::Render(const Scene& scene, const Camera& camera, uint32_t frameIndex, const RenderSettings& settings, bool trace)
+void GpuPathTracer::Render(const Scene& scene, const Camera& camera, const RenderSettings& settings, const FrameParams& frame)
 {
 	if (!m_Initialized || m_Width == 0 || m_Height == 0)
 		return;
@@ -470,12 +471,13 @@ void GpuPathTracer::Render(const Scene& scene, const Camera& camera, uint32_t fr
 	PushConstants pushConstants{};
 	pushConstants.Width = m_Width;
 	pushConstants.Height = m_Height;
-	pushConstants.FrameIndex = frameIndex;
+	pushConstants.FirstSampleIndex = frame.FirstSampleIndex;
 	pushConstants.SphereCount = sphereCount;
 	pushConstants.Bounces = (uint32_t)std::max(settings.MaxBounces, 1);
 	pushConstants.RussianRoulette = settings.RussianRoulette ? 1u : 0u;
 	pushConstants.RussianRouletteStartBounce = (uint32_t)std::max(settings.RussianRouletteStartBounce, 0);
-	pushConstants.Trace = trace ? 1u : 0u;
+	pushConstants.SampleCount = frame.SampleCount;
+	pushConstants.ResetAccumulation = frame.ResetAccumulation ? 1u : 0u;
 	pushConstants.Exposure = settings.Exposure;
 	pushConstants.ToneMapper = (uint32_t)settings.ToneMapping;
 	pushConstants.SRGBOutput = settings.SRGBOutput ? 1u : 0u;

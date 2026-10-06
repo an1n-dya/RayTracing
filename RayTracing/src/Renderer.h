@@ -27,7 +27,7 @@ public:
 	uint32_t GetFinalImageHeight() const;
 
 	void ResetFrameIndex() { m_FrameIndex = 1; }
-	uint32_t GetSampleCount() const { return m_SampleCount; }
+	uint32_t GetSampleCount() const { return m_AccumulatedSamples; }
 	bool IsConverged() const;
 	Settings& GetSettings() { return m_Settings; }
 private:
@@ -61,6 +61,6 @@ private:
 	uint32_t* m_ImageData = nullptr;
 	glm::vec4* m_AccumulationData = nullptr;
 
-	uint32_t m_FrameIndex = 1;
-	uint32_t m_SampleCount = 0; // samples per pixel in the image currently displayed
+	uint32_t m_FrameIndex = 1;         // 1 = the next frame starts a fresh accumulation
+	uint32_t m_AccumulatedSamples = 0; // samples per pixel in the image currently displayed
 };

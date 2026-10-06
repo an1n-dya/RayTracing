@@ -82,7 +82,8 @@ void Renderer::OnResize(uint32_t width, uint32_t height) {
 }
 
 bool Renderer::IsConverged() const {
-	return m_Settings.Accumulate && m_Settings.MaxSamples > 0 && m_FrameIndex > (uint32_t)m_Settings.MaxSamples;
+	return m_Settings.Accumulate && m_Settings.MaxSamples > 0 && m_FrameIndex > 1
+		&& m_AccumulatedSamples >= (uint32_t)m_Settings.MaxSamples;
 }
 
 bool Renderer::Render(const Scene& scene, const Camera& camera) {
@@ -92,31 +93,39 @@ bool Renderer::Render(const Scene& scene, const Camera& camera) {
 	m_ActiveScene = &scene;
 	m_ActiveCamera = &camera;
 
-	// Once converged, only re-resolve the accumulated image (so exposure/tone mapping stay live)
-	bool trace = !IsConverged();
+	if (m_FrameIndex == 1)
+		m_AccumulatedSamples = 0;
+
+	FrameParams frame;
+	frame.ResetAccumulation = m_FrameIndex == 1;
+	frame.FirstSampleIndex = m_AccumulatedSamples;
+	frame.SampleCount = (uint32_t)std::max(m_Settings.SamplesPerFrame, 1);
+	if (m_Settings.Accumulate && m_Settings.MaxSamples > 0) // don't overshoot the limit
+		frame.SampleCount = std::min(frame.SampleCount, (uint32_t)m_Settings.MaxSamples - std::min(m_AccumulatedSamples, (uint32_t)m_Settings.MaxSamples));
+	// Once converged SampleCount is 0: only re-resolve the accumulated image (so exposure/tone mapping stay live)
 
 	if (m_Settings.UseGPU) {
-		m_GpuPathTracer.Render(scene, camera, m_FrameIndex, m_Settings, trace);
+		m_GpuPathTracer.Render(scene, camera, m_Settings, frame);
 	}
 	else {
 		uint32_t width = m_FinalImage->GetWidth();
-		if (trace && m_FrameIndex == 1)
+		if (frame.ResetAccumulation)
 			memset(m_AccumulationData, 0, width * m_FinalImage->GetHeight() * sizeof(glm::vec4));
 
-		Utils::ForEachPixel(m_ImageHorizontalIter, m_ImageVerticalIter, [this, trace, width](uint32_t x, uint32_t y) {
+		Utils::ForEachPixel(m_ImageHorizontalIter, m_ImageVerticalIter, [this, &frame, width](uint32_t x, uint32_t y) {
 			uint32_t index = x + y * width;
-			if (trace)
-				m_AccumulationData[index] += PerPixel(x, y, m_FrameIndex);
+			for (uint32_t s = 0; s < frame.SampleCount; s++)
+				m_AccumulationData[index] += PerPixel(x, y, frame.FirstSampleIndex + s);
 			m_ImageData[index] = Utils::ConvertToRGBA(ToneMapping::Resolve(m_AccumulationData[index], m_Settings));
 		});
 
 		m_FinalImage->SetData(m_ImageData);
 	}
 
-	if (!trace)
+	if (frame.SampleCount == 0)
 		return false;
 
-	m_SampleCount = m_FrameIndex;
+	m_AccumulatedSamples += frame.SampleCount;
 
 	if (m_Settings.Accumulate)
 		m_FrameIndex++;

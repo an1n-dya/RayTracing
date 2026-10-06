@@ -41,16 +41,17 @@ layout(binding = 4, rgba8) uniform image2D DisplayImage;
 layout(push_constant) uniform PushConstants {
 	uint Width;
 	uint Height;
-	uint FrameIndex;
+	uint FirstSampleIndex; // global index of this frame's first sample (seeds the RNG)
 	uint SphereCount;
 	uint Bounces;
 	uint RussianRoulette;
 	uint RussianRouletteStartBounce;
-	uint Trace;       // 0 = only re-resolve the accumulated image (converged)
+	uint SampleCount; // samples per pixel this frame; 0 = only re-resolve the accumulated image (converged)
 	float Exposure;   // stops
 	uint ToneMapper;  // 0 = none, 1 = Reinhard, 2 = ACES
 	uint SRGBOutput;
 	uint AntiAliasing; // jitter samples within the pixel
+	uint ResetAccumulation;
 } u_PC;
 
 // -- RNG: same PCG hash as Utils::PCG_Hash / RandomFloat / InUnitSphere in Renderer.cpp --
@@ -248,21 +249,13 @@ void main()
 	if (pixelCoord.x >= u_PC.Width || pixelCoord.y >= u_PC.Height)
 		return;
 
-	vec4 accumulatedColor;
-	if (u_PC.Trace != 0u)
+	vec4 accumulatedColor = u_PC.ResetAccumulation != 0u ? vec4(0.0) : imageLoad(AccumulationImage, ivec2(pixelCoord));
+	if (u_PC.SampleCount > 0u)
 	{
-		vec3 color = PerPixel(pixelCoord, u_PC.FrameIndex);
-
-		if (u_PC.FrameIndex == 1u)
-			accumulatedColor = vec4(color, 1.0);
-		else
-			accumulatedColor = imageLoad(AccumulationImage, ivec2(pixelCoord)) + vec4(color, 1.0);
+		for (uint s = 0u; s < u_PC.SampleCount; s++)
+			accumulatedColor += vec4(PerPixel(pixelCoord, u_PC.FirstSampleIndex + s), 1.0);
 
 		imageStore(AccumulationImage, ivec2(pixelCoord), accumulatedColor);
-	}
-	else
-	{
-		accumulatedColor = imageLoad(AccumulationImage, ivec2(pixelCoord));
 	}
 
 	imageStore(DisplayImage, ivec2(pixelCoord), ResolveColor(accumulatedColor));
