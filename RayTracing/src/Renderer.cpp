@@ -266,6 +266,22 @@ Renderer::HitPayload Renderer::Miss(const Ray& ray) {
 	return payload;
 }
 
+ObjectRef Renderer::Pick(const Scene& scene, const Camera& camera, const glm::vec2& ndc, float* outDistance) {
+	m_ActiveScene = &scene;
+
+	Ray ray;
+	ray.Origin = camera.GetPosition();
+	ray.Direction = camera.GetRayDirection(ndc);
+
+	HitPayload payload = TraceRay(ray);
+	if (payload.HitDistance < 0.0f)
+		return {};
+
+	if (outDistance)
+		*outDistance = payload.HitDistance;
+	return { ObjectType::Sphere, payload.ObjectIndex };
+}
+
 bool Renderer::SaveImage(const std::string& path) {
 	uint32_t width = GetFinalImageWidth();
 	uint32_t height = GetFinalImageHeight();

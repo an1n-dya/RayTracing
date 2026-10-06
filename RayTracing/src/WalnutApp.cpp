@@ -8,6 +8,8 @@
 #include "Camera.h"
 #include "FileDialogs.h"
 
+#include "imgui_internal.h" // DockId lookup for default panel placement
+
 #include <glm/gtc/type_ptr.hpp>
 
 #include <cstdio>
@@ -42,6 +44,14 @@ static AppOptions ParseCommandLine(int argc, char** argv) {
 			fprintf(stderr, "Unknown or incomplete argument: %s\n", arg);
 	}
 	return options;
+}
+
+// Panels without a saved layout (e.g. ones added after imgui.ini was written) open as tabs next to the
+// Scene panel instead of floating over the viewport
+static void DockNextToScenePanel() {
+	ImGuiWindow* scenePanel = ImGui::FindWindowByName("Scene");
+	if (scenePanel && scenePanel->DockId != 0)
+		ImGui::SetNextWindowDockID(scenePanel->DockId, ImGuiCond_FirstUseEver);
 }
 
 class AppLayer : public Walnut::Layer {
@@ -217,6 +227,18 @@ private:
 				m_Camera.SetFocusDistance(std::max(focusDistance, 0.01f));
 				m_Renderer.ResetFrameIndex();
 			}
+			ImGui::BeginDisabled(!m_Selection.IsValid());
+			if (ImGui::Button("Focus on Selection")) {
+				glm::vec3 min, max;
+				if (m_Scene.GetBounds(m_Selection, min, max)) {
+					float distance = glm::dot(0.5f * (min + max) - m_Camera.GetPosition(), m_Camera.GetDirection());
+					m_Camera.SetFocusDistance(std::max(distance, 0.01f));
+					m_Renderer.ResetFrameIndex();
+				}
+			}
+			ImGui::EndDisabled();
+			ImGui::SameLine();
+			ImGui::TextDisabled("(or Ctrl+click in the viewport)");
 		}
 
 		ImGui::End();
@@ -306,6 +328,7 @@ private:
 	}
 
 	void DrawMaterialsPanel() {
+		DockNextToScenePanel();
 		ImGui::Begin("Materials");
 
 		if (ImGui::Button("Add Material")) {
@@ -351,6 +374,7 @@ private:
 	}
 
 	void DrawEnvironmentPanel() {
+		DockNextToScenePanel();
 		ImGui::Begin("Environment");
 
 		SkySettings& sky = m_Scene.Sky;
@@ -378,13 +402,63 @@ private:
 		m_ViewportHeight = (uint32_t)ImGui::GetContentRegionAvail().y;
 
 		VkDescriptorSet imageDescriptor = m_Renderer.GetFinalImageDescriptorSet();
-		if (imageDescriptor)
-			ImGui::Image(imageDescriptor,
-				{ (float)m_Renderer.GetFinalImageWidth(), (float)m_Renderer.GetFinalImageHeight() },
-				ImVec2(0, 1), ImVec2(1, 0));
+		if (imageDescriptor) {
+			ImVec2 imageSize = { (float)m_Renderer.GetFinalImageWidth(), (float)m_Renderer.GetFinalImageHeight() };
+			ImGui::Image(imageDescriptor, imageSize, ImVec2(0, 1), ImVec2(1, 0));
+			ImVec2 imageMin = ImGui::GetItemRectMin();
+
+			// Left click selects, Ctrl+left click focuses the camera on the point under the cursor.
+			// (Right mouse is camera look, so ignore clicks while it's held.)
+			if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
+				ImVec2 mouse = ImGui::GetMousePos();
+				// The image is drawn flipped (row 0 = bottom), so NDC y points up
+				glm::vec2 ndc = { (mouse.x - imageMin.x) / imageSize.x * 2.0f - 1.0f, 1.0f - (mouse.y - imageMin.y) / imageSize.y * 2.0f };
+
+				float distance = 0.0f;
+				ObjectRef hit = m_Renderer.Pick(m_Scene, m_Camera, ndc, &distance);
+				if (ImGui::GetIO().KeyCtrl) {
+					if (hit.IsValid()) {
+						// Focus distance is measured along the view direction, not along the ray
+						float depth = distance * glm::dot(m_Camera.GetRayDirection(ndc), m_Camera.GetDirection());
+						m_Camera.SetFocusDistance(std::max(depth, 0.01f));
+						m_Renderer.ResetFrameIndex();
+					}
+				}
+				else {
+					m_Selection = hit;
+				}
+			}
+
+			DrawSelectionOutline(imageMin, imageSize);
+		}
 
 		ImGui::End();
 		ImGui::PopStyleVar();
+	}
+
+	// Outlines the selected object's projected bounding box over the viewport image
+	void DrawSelectionOutline(const ImVec2& imageMin, const ImVec2& imageSize) {
+		glm::vec3 min, max;
+		if (!m_Scene.GetBounds(m_Selection, min, max))
+			return;
+
+		glm::mat4 viewProjection = m_Camera.GetProjection() * m_Camera.GetView();
+		glm::vec2 screenMin(FLT_MAX), screenMax(-FLT_MAX);
+		for (int corner = 0; corner < 8; corner++) {
+			glm::vec3 point = { corner & 1 ? max.x : min.x, corner & 2 ? max.y : min.y, corner & 4 ? max.z : min.z };
+			glm::vec4 clip = viewProjection * glm::vec4(point, 1.0f);
+			if (clip.w <= 0.0001f)
+				return; // part of the box is behind the camera: its projection isn't meaningful
+			glm::vec2 ndc = glm::vec2(clip) / clip.w;
+			glm::vec2 screen = { imageMin.x + (ndc.x * 0.5f + 0.5f) * imageSize.x, imageMin.y + (0.5f - ndc.y * 0.5f) * imageSize.y };
+			screenMin = glm::min(screenMin, screen);
+			screenMax = glm::max(screenMax, screen);
+		}
+
+		ImDrawList* drawList = ImGui::GetWindowDrawList();
+		drawList->PushClipRect(imageMin, ImVec2(imageMin.x + imageSize.x, imageMin.y + imageSize.y), true);
+		drawList->AddRect(ImVec2(screenMin.x, screenMin.y), ImVec2(screenMax.x, screenMax.y), IM_COL32(255, 200, 0, 220), 0.0f, 0, 1.5f);
+		drawList->PopClipRect();
 	}
 
 	void ExportImage() {

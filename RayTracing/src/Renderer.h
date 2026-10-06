@@ -23,6 +23,10 @@ public:
 	// (tone mapped) every call so post-processing settings stay live
 	bool Render(const Scene& scene, const Camera& camera);
 
+	// Editor picking: casts a pinhole ray through ndc (each axis -1 -> 1) on the CPU, whichever path is rendering.
+	// Returns the closest object hit (invalid if none) and optionally its distance along the ray.
+	ObjectRef Pick(const Scene& scene, const Camera& camera, const glm::vec2& ndc, float* outDistance = nullptr);
+
 	// Writes the current image from whichever path is active: .hdr = linear radiance, anything else = tone mapped PNG
 	bool SaveImage(const std::string& path);
 

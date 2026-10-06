@@ -7,6 +7,22 @@ bool Scene::IsValid(const ObjectRef& object) const {
 	}
 }
 
+bool Scene::GetBounds(const ObjectRef& object, glm::vec3& min, glm::vec3& max) const {
+	if (!IsValid(object))
+		return false;
+
+	switch (object.Type) {
+	case ObjectType::Sphere: {
+		const Sphere& sphere = Spheres[object.Index];
+		min = sphere.Position - glm::vec3(sphere.Radius);
+		max = sphere.Position + glm::vec3(sphere.Radius);
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
 ObjectRef Scene::AddSphere() {
 	Sphere& sphere = Spheres.emplace_back();
 	sphere.Radius = 0.5f;

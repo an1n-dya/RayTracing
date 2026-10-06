@@ -64,6 +64,8 @@ struct Scene{
 	SkySettings Sky;
 
 	bool IsValid(const ObjectRef& object) const;
+	// World-space axis-aligned bounds; false for invalid (or unbounded) objects
+	bool GetBounds(const ObjectRef& object, glm::vec3& min, glm::vec3& max) const;
 
 	// Returns the new object; copies of existing objects are offset slightly so they're visible
 	ObjectRef AddSphere();
