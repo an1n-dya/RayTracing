@@ -29,6 +29,7 @@ struct RenderSettings {
 	int SamplesPerFrame = 1;
 	bool SlowRandom = false; // CPU only: use Walnut::Random instead of the PCG hash
 	bool UseGPU = false;
+	bool HardwareRayTracing = true; // GPU path: trace with RT cores (VK_KHR_ray_query) when the GPU supports it
 
 	CompareMode Compare = CompareMode::Off;
 	float CompareSplit = 0.5f;      // divider position for CompareMode::Split, 0..1 across the viewport

@@ -43,6 +43,9 @@ public:
 	// Mean |CPU - GPU| over all pixels and channels, in 8-bit units (updated in CompareMode::Difference)
 	float GetCompareMeanError() const { return m_CompareMeanError; }
 
+	// Whether the Vulkan device has hardware ray tracing (ray query) for Settings.HardwareRayTracing
+	static bool IsHardwareRayTracingSupported();
+
 	void ResetFrameIndex() { m_FrameIndex = 1; }
 	uint32_t GetSampleCount() const { return m_AccumulatedSamples; }
 	bool IsConverged() const;

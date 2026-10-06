@@ -9,6 +9,8 @@
 
 #include "Walnut/Random.h"
 
+#include "WalnutExtensions.h"
+
 #include <execution>
 #include <filesystem>
 
@@ -82,6 +84,10 @@ void Renderer::OnResize(uint32_t width, uint32_t height) {
 		m_ImageHorizontalIter[i] = i;
 	for (uint32_t i = 0; i < height; i++)
 		m_ImageVerticalIter[i] = i;
+}
+
+bool Renderer::IsHardwareRayTracingSupported() {
+	return WalnutExtensions::IsRayQuerySupported();
 }
 
 bool Renderer::IsConverged() const {

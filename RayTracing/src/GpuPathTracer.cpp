@@ -1,5 +1,9 @@
 #include "GpuPathTracer.h"
 
+#include "RayQueryScene.h"
+#include "VulkanHelpers.h"
+#include "WalnutExtensions.h"
+
 #include "Walnut/Application.h"
 
 #include "backends/imgui_impl_vulkan.h"
@@ -11,6 +15,8 @@
 #include <fstream>
 #include <stdexcept>
 #include <vector>
+
+using namespace VulkanHelpers;
 
 namespace {
 
@@ -59,6 +65,9 @@ namespace {
 		VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
 		VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
 	};
+
+	// Only in the layout when the device supports ray query: PathTraceRQ.comp's top-level acceleration structure
+	constexpr uint32_t TopLevelASBinding = Binding::Count;
 
 	// Denoise.comp's bindings: accumulation, albedo/depth, normal/moment, ping, pong (all rgba32f), display (rgba8)
 	constexpr uint32_t DenoiseBindingCount = 6;
@@ -152,195 +161,14 @@ namespace {
 		uint32_t SRGBOutput;
 	};
 
-	uint32_t FindMemoryType(VkMemoryPropertyFlags properties, uint32_t typeBits)
-	{
-		VkPhysicalDeviceMemoryProperties memProperties;
-		vkGetPhysicalDeviceMemoryProperties(Walnut::Application::GetPhysicalDevice(), &memProperties);
-		for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++)
-		{
-			if ((memProperties.memoryTypes[i].propertyFlags & properties) == properties && (typeBits & (1 << i)))
-				return i;
-		}
-		return 0xffffffff;
-	}
-
-	// Host-visible + coherent buffer. Prefers memory that is also device-local (resizable BAR), which the
-	// shader can read at full speed, and falls back to plain host memory if there is none (or it's full).
-	void CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buffer, VkDeviceMemory& memory, void** mapped)
-	{
-		VkDevice device = Walnut::Application::GetDevice();
-
-		VkBufferCreateInfo bufferInfo{};
-		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-		bufferInfo.size = size;
-		bufferInfo.usage = usage;
-		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-		VkResult err = vkCreateBuffer(device, &bufferInfo, nullptr, &buffer);
-		check_vk_result(err);
-
-		VkMemoryRequirements memReq;
-		vkGetBufferMemoryRequirements(device, buffer, &memReq);
-
-		VkMemoryAllocateInfo allocInfo{};
-		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-		allocInfo.allocationSize = memReq.size;
-
-		const VkMemoryPropertyFlags hostVisible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-		allocInfo.memoryTypeIndex = FindMemoryType(hostVisible | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memReq.memoryTypeBits);
-		err = allocInfo.memoryTypeIndex != 0xffffffff ? vkAllocateMemory(device, &allocInfo, nullptr, &memory) : VK_ERROR_OUT_OF_DEVICE_MEMORY;
-		if (err != VK_SUCCESS)
-		{
-			allocInfo.memoryTypeIndex = FindMemoryType(hostVisible, memReq.memoryTypeBits);
-			err = vkAllocateMemory(device, &allocInfo, nullptr, &memory);
-			check_vk_result(err);
-		}
-
-		err = vkBindBufferMemory(device, buffer, memory, 0);
-		check_vk_result(err);
-
-		if (mapped)
-		{
-			err = vkMapMemory(device, memory, 0, size, 0, mapped);
-			check_vk_result(err);
-		}
-	}
-
-	void CreateStorageImage(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage,
-		VkImage& image, VkDeviceMemory& memory, VkImageView& view)
-	{
-		VkDevice device = Walnut::Application::GetDevice();
-
-		VkImageCreateInfo imageInfo{};
-		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-		imageInfo.imageType = VK_IMAGE_TYPE_2D;
-		imageInfo.format = format;
-		imageInfo.extent = { width, height, 1 };
-		imageInfo.mipLevels = 1;
-		imageInfo.arrayLayers = 1;
-		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-		imageInfo.usage = usage;
-		imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-		VkResult err = vkCreateImage(device, &imageInfo, nullptr, &image);
-		check_vk_result(err);
-
-		VkMemoryRequirements memReq;
-		vkGetImageMemoryRequirements(device, image, &memReq);
-
-		VkMemoryAllocateInfo allocInfo{};
-		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-		allocInfo.allocationSize = memReq.size;
-		allocInfo.memoryTypeIndex = FindMemoryType(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memReq.memoryTypeBits);
-		err = vkAllocateMemory(device, &allocInfo, nullptr, &memory);
-		check_vk_result(err);
-
-		err = vkBindImageMemory(device, image, memory, 0);
-		check_vk_result(err);
-
-		VkImageViewCreateInfo viewInfo{};
-		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-		viewInfo.image = image;
-		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-		viewInfo.format = format;
-		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		viewInfo.subresourceRange.levelCount = 1;
-		viewInfo.subresourceRange.layerCount = 1;
-		err = vkCreateImageView(device, &viewInfo, nullptr, &view);
-		check_vk_result(err);
-	}
-
-	std::vector<char> ReadFile(const std::string& path)
-	{
-		std::ifstream file(path, std::ios::ate | std::ios::binary);
-		if (!file.is_open())
-			throw std::runtime_error("GpuPathTracer: failed to open shader file: " + path);
-
-		size_t fileSize = (size_t)file.tellg();
-		std::vector<char> buffer(fileSize);
-		file.seekg(0);
-		file.read(buffer.data(), fileSize);
-		return buffer;
-	}
-
-	VkShaderModule CreateShaderModule(const std::vector<char>& code)
-	{
-		VkShaderModuleCreateInfo createInfo{};
-		createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-		createInfo.codeSize = code.size();
-		createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-
-		VkShaderModule shaderModule;
-		VkResult err = vkCreateShaderModule(Walnut::Application::GetDevice(), &createInfo, nullptr, &shaderModule);
-		check_vk_result(err);
-		return shaderModule;
-	}
-
-	void CreateComputePipeline(VkShaderModule module, VkDescriptorSetLayout setLayout, uint32_t pushConstantSize,
-		VkPipelineLayout& pipelineLayout, VkPipeline& pipeline)
-	{
-		VkDevice device = Walnut::Application::GetDevice();
-
-		VkPushConstantRange pushConstantRange{};
-		pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-		pushConstantRange.offset = 0;
-		pushConstantRange.size = pushConstantSize;
-
-		VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
-		pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-		pipelineLayoutInfo.setLayoutCount = 1;
-		pipelineLayoutInfo.pSetLayouts = &setLayout;
-		pipelineLayoutInfo.pushConstantRangeCount = 1;
-		pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
-		VkResult err = vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout);
-		check_vk_result(err);
-
-		VkPipelineShaderStageCreateInfo stageInfo{};
-		stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-		stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-		stageInfo.module = module;
-		stageInfo.pName = "main";
-
-		VkComputePipelineCreateInfo pipelineInfo{};
-		pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-		pipelineInfo.stage = stageInfo;
-		pipelineInfo.layout = pipelineLayout;
-		err = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
-		check_vk_result(err);
-	}
-
 	VkBufferUsageFlags GetBufferUsage(VkDescriptorType type)
 	{
 		return type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT : VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 	}
 
-	void CreateDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buffer, VkDeviceMemory& memory)
-	{
-		VkDevice device = Walnut::Application::GetDevice();
-
-		VkBufferCreateInfo bufferInfo{};
-		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-		bufferInfo.size = size;
-		bufferInfo.usage = usage;
-		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-		VkResult err = vkCreateBuffer(device, &bufferInfo, nullptr, &buffer);
-		check_vk_result(err);
-
-		VkMemoryRequirements memReq;
-		vkGetBufferMemoryRequirements(device, buffer, &memReq);
-
-		VkMemoryAllocateInfo allocInfo{};
-		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-		allocInfo.allocationSize = memReq.size;
-		allocInfo.memoryTypeIndex = FindMemoryType(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memReq.memoryTypeBits);
-		err = vkAllocateMemory(device, &allocInfo, nullptr, &memory);
-		check_vk_result(err);
-
-		err = vkBindBufferMemory(device, buffer, memory, 0);
-		check_vk_result(err);
-	}
-
 }
+
+GpuPathTracer::GpuPathTracer() = default;
 
 GpuPathTracer::~GpuPathTracer()
 {
@@ -358,9 +186,15 @@ GpuPathTracer::~GpuPathTracer()
 		pipelineLayout = m_PipelineLayout, descriptorSetLayout = m_DescriptorSetLayout, descriptorPool = m_DescriptorPool,
 		sampler = m_DisplaySampler, buffers, denoiseShaderModule = m_DenoiseShaderModule, denoisePipeline = m_DenoisePipeline,
 		denoisePipelineLayout = m_DenoisePipelineLayout, denoiseSetLayout = m_DenoiseDescriptorSetLayout,
-		denoisePool = m_DenoiseDescriptorPool]()
+		denoisePool = m_DenoiseDescriptorPool, rayQueryShaderModule = m_RayQueryShaderModule, rayQueryPipeline = m_RayQueryPipeline]()
 	{
 		VkDevice device = Walnut::Application::GetDevice();
+
+		if (rayQueryPipeline != VK_NULL_HANDLE)
+		{
+			vkDestroyPipeline(device, rayQueryPipeline, nullptr);
+			vkDestroyShaderModule(device, rayQueryShaderModule, nullptr);
+		}
 
 		vkDestroyPipeline(device, denoisePipeline, nullptr);
 		vkDestroyPipelineLayout(device, denoisePipelineLayout, nullptr);
@@ -395,23 +229,49 @@ void GpuPathTracer::Init()
 	auto shaderCode = ReadFile("src/shaders/PathTrace.comp.spv");
 	m_ShaderModule = CreateShaderModule(shaderCode);
 
-	VkDescriptorSetLayoutBinding bindings[Binding::Count]{};
+	bool rayQuery = WalnutExtensions::IsRayQuerySupported();
+
+	std::vector<VkDescriptorSetLayoutBinding> bindings;
 	for (uint32_t i = 0; i < Binding::Count; i++)
-		bindings[i] = { i, BindingTypes[i], 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+		bindings.push_back({ i, BindingTypes[i], 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr });
+	if (rayQuery)
+		bindings.push_back({ TopLevelASBinding, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr });
 
 	VkDescriptorSetLayoutCreateInfo layoutInfo{};
 	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	layoutInfo.bindingCount = Binding::Count;
-	layoutInfo.pBindings = bindings;
+	layoutInfo.bindingCount = (uint32_t)bindings.size();
+	layoutInfo.pBindings = bindings.data();
 	VkResult err = vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_DescriptorSetLayout);
 	check_vk_result(err);
 
 	CreateComputePipeline(m_ShaderModule, m_DescriptorSetLayout, sizeof(PushConstants), m_PipelineLayout, m_Pipeline);
 
+	if (rayQuery)
+	{
+		m_RayQueryShaderModule = CreateShaderModule(ReadFile("src/shaders/PathTraceRQ.comp.spv"));
+
+		VkPipelineShaderStageCreateInfo stageInfo{};
+		stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+		stageInfo.module = m_RayQueryShaderModule;
+		stageInfo.pName = "main";
+
+		VkComputePipelineCreateInfo pipelineInfo{};
+		pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+		pipelineInfo.stage = stageInfo;
+		pipelineInfo.layout = m_PipelineLayout;
+		err = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_RayQueryPipeline);
+		check_vk_result(err);
+
+		m_RayQuery = std::make_unique<RayQueryScene>();
+	}
+	printf("GPU path tracer: hardware ray tracing (VK_KHR_ray_query) %s\n", rayQuery ? "available" : "not available");
+
 	// One pool entry per binding of each type
 	std::vector<VkDescriptorPoolSize> poolSizes;
-	for (VkDescriptorType type : BindingTypes)
+	for (const VkDescriptorSetLayoutBinding& binding : bindings)
 	{
+		VkDescriptorType type = binding.descriptorType;
 		auto it = std::find_if(poolSizes.begin(), poolSizes.end(), [type](const VkDescriptorPoolSize& size) { return size.type == type; });
 		if (it != poolSizes.end())
 			it->descriptorCount++;
@@ -536,8 +396,13 @@ void GpuPathTracer::UploadGeometry(const Scene& scene)
 			indices.push_back(vertexOffset + index);
 	}
 
-	UploadStatic(m_VertexBuffer, Binding::Vertices, vertices.data(), vertices.size() * sizeof(VertexGPU));
-	UploadStatic(m_IndexBuffer, Binding::Indices, indices.data(), indices.size() * sizeof(uint32_t));
+	// With ray query, the vertex and index buffers double as acceleration structure build inputs
+	VkBufferUsageFlags geometryUsage = m_RayQuery
+		? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR : 0;
+	UploadStatic(m_VertexBuffer, Binding::Vertices, vertices.data(), vertices.size() * sizeof(VertexGPU), geometryUsage);
+	UploadStatic(m_IndexBuffer, Binding::Indices, indices.data(), indices.size() * sizeof(uint32_t), geometryUsage);
+	if (m_RayQuery)
+		m_RayQuery->BuildMeshes(scene, m_VertexBuffer.Handle, (uint32_t)vertices.size(), m_IndexBuffer.Handle, m_MeshFirstTriangle);
 	UploadStatic(m_BVHBuffer, Binding::BVHNodes, nodes.data(), nodes.size() * sizeof(BVHNode));
 
 	m_GeometryUploaded = true;
@@ -587,12 +452,13 @@ void GpuPathTracer::ReleaseBuffer(Buffer& buffer)
 	buffer = {};
 }
 
-void GpuPathTracer::UploadStatic(Buffer& buffer, uint32_t binding, const void* data, VkDeviceSize size)
+void GpuPathTracer::UploadStatic(Buffer& buffer, uint32_t binding, const void* data, VkDeviceSize size, VkBufferUsageFlags extraUsage)
 {
 	ReleaseBuffer(buffer);
 
 	buffer.Size = std::max<VkDeviceSize>(size, 256);
-	CreateDeviceLocalBuffer(buffer.Size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, buffer.Handle, buffer.Memory);
+	CreateDeviceLocalBuffer(buffer.Size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | extraUsage, buffer.Handle, buffer.Memory,
+		(extraUsage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0);
 	WriteBufferDescriptor(binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, buffer);
 
 	if (size == 0)
@@ -656,6 +522,23 @@ void GpuPathTracer::WriteBufferDescriptor(uint32_t binding, VkDescriptorType typ
 	write.descriptorCount = 1;
 	write.descriptorType = type;
 	write.pBufferInfo = &bufferInfo;
+	vkUpdateDescriptorSets(Walnut::Application::GetDevice(), 1, &write, 0, nullptr);
+}
+
+void GpuPathTracer::WriteTopLevelDescriptor()
+{
+	VkAccelerationStructureKHR topLevel = m_RayQuery->GetTopLevel();
+
+	VkWriteDescriptorSetAccelerationStructureKHR accelerationStructureInfo{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
+	accelerationStructureInfo.accelerationStructureCount = 1;
+	accelerationStructureInfo.pAccelerationStructures = &topLevel;
+
+	VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+	write.pNext = &accelerationStructureInfo;
+	write.dstSet = m_DescriptorSet;
+	write.dstBinding = TopLevelASBinding;
+	write.descriptorCount = 1;
+	write.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 	vkUpdateDescriptorSets(Walnut::Application::GetDevice(), 1, &write, 0, nullptr);
 }
 
@@ -966,7 +849,13 @@ void GpuPathTracer::Render(const Scene& scene, const PreparedScene& prepared, co
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
-	vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_Pipeline);
+	// Hardware ray tracing: rebuild the top-level structure for this frame's transforms. Its descriptor has to be
+	// up to date before the set is bound below.
+	bool rayQuery = m_RayQuery && settings.HardwareRayTracing;
+	if (rayQuery && m_RayQuery->BuildTopLevel(commandBuffer, scene, prepared))
+		WriteTopLevelDescriptor();
+
+	vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rayQuery ? m_RayQueryPipeline : m_Pipeline);
 	vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_PipelineLayout, 0, 1, &m_DescriptorSet, 0, nullptr);
 	vkCmdPushConstants(commandBuffer, m_PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pushConstants);
 

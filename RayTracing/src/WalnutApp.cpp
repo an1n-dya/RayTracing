@@ -31,6 +31,7 @@ using namespace Walnut;
 //   --cpu / --gpu              pick the render path
 //   --no-light-sampling        disable next-event estimation (for checking it doesn't change the result)
 //   --denoise                  enable the denoiser
+//   --no-hwrt                  GPU path: use the compute shader's own BVH traversal instead of hardware ray tracing
 //   --compare split|difference CPU vs GPU compare view
 struct AppOptions {
 	std::string ScenePath;
@@ -41,6 +42,7 @@ struct AppOptions {
 	CompareMode Compare = CompareMode::Off; // --compare split|difference
 	bool DisableLightSampling = false;
 	bool Denoise = false;
+	bool DisableHardwareRayTracing = false;
 };
 
 static AppOptions ParseCommandLine(int argc, char** argv) {
@@ -64,6 +66,8 @@ static AppOptions ParseCommandLine(int argc, char** argv) {
 			options.DisableLightSampling = true;
 		else if (strcmp(arg, "--denoise") == 0)
 			options.Denoise = true;
+		else if (strcmp(arg, "--no-hwrt") == 0)
+			options.DisableHardwareRayTracing = true;
 		else if (strcmp(arg, "--compare") == 0 && hasValue) {
 			const char* mode = argv[++i];
 			options.Compare = strcmp(mode, "split") == 0 ? CompareMode::Split : strcmp(mode, "difference") == 0 ? CompareMode::Difference : CompareMode::Off;
@@ -94,6 +98,8 @@ public:
 			m_Renderer.GetSettings().LightSampling = false;
 		if (m_Options.Denoise)
 			m_Renderer.GetSettings().Denoise = true;
+		if (m_Options.DisableHardwareRayTracing)
+			m_Renderer.GetSettings().HardwareRayTracing = false;
 		if (!m_Options.RenderOutputPath.empty())
 			m_Renderer.GetSettings().MaxSamples = m_Options.RenderSamples;
 
@@ -334,6 +340,14 @@ private:
 		// The CPU and GPU paths keep separate accumulation buffers, so restart when switching
 		if (ImGui::Checkbox("Use GPU", &m_Renderer.GetSettings().UseGPU))
 			m_Renderer.ResetFrameIndex();
+		ImGui::SameLine();
+		ImGui::BeginDisabled(!Renderer::IsHardwareRayTracingSupported() || !m_Renderer.GetSettings().UseGPU);
+		ImGui::Checkbox("Hardware RT", &m_Renderer.GetSettings().HardwareRayTracing);
+		ImGui::EndDisabled();
+		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+			ImGui::SetTooltip(Renderer::IsHardwareRayTracingSupported()
+				? "Trace spheres and meshes with the GPU's ray tracing hardware (VK_KHR_ray_query)\ninstead of the compute shader's own BVH traversal"
+				: "This GPU/driver doesn't support VK_KHR_ray_query");
 
 		ImGui::BeginDisabled(m_Renderer.GetSettings().UseGPU);
 		ImGui::Checkbox("Slow Random", &m_Renderer.GetSettings().SlowRandom);

@@ -10,7 +10,10 @@
 #include <glm/glm.hpp>
 
 #include <cstdint>
+#include <memory>
 #include <vector>
+
+class RayQueryScene;
 
 // Vulkan compute-shader path tracer. Owns its own storage image (never touches Walnut::Image),
 // which it registers directly with ImGui via ImGui_ImplVulkan_AddTexture so it can be drawn
@@ -18,7 +21,7 @@
 // see RayTracing/src/shaders/PathTrace.comp for the shader itself.
 class GpuPathTracer {
 public:
-	GpuPathTracer() = default;
+	GpuPathTracer();
 	~GpuPathTracer();
 
 	GpuPathTracer(const GpuPathTracer&) = delete;
@@ -64,7 +67,8 @@ private:
 	void Upload(Buffer& buffer, uint32_t binding, VkDescriptorType type, const void* data, VkDeviceSize size);
 	// Replaces buffer with a device-local storage buffer filled through a staging copy, for big data that rarely
 	// changes (mesh geometry, environment maps) - fast to read even without resizable BAR
-	void UploadStatic(Buffer& buffer, uint32_t binding, const void* data, VkDeviceSize size);
+	void UploadStatic(Buffer& buffer, uint32_t binding, const void* data, VkDeviceSize size, VkBufferUsageFlags extraUsage = 0);
+	void WriteTopLevelDescriptor();
 	static void ReleaseBuffer(Buffer& buffer); // deferred until the GPU is done with it
 	void WriteBufferDescriptor(uint32_t binding, VkDescriptorType type, const Buffer& buffer);
 	void WriteImageDescriptor(VkDescriptorSet set, uint32_t binding, VkImageView view);
@@ -83,6 +87,12 @@ private:
 	VkPipeline m_Pipeline = VK_NULL_HANDLE;
 	VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;
 	VkDescriptorSet m_DescriptorSet = VK_NULL_HANDLE; // compute shader bindings (UBO/SSBOs/images)
+
+	// Hardware ray tracing: the same shader compiled with USE_RAY_QUERY (PathTraceRQ.comp.spv), sharing the pipeline
+	// layout, plus the acceleration structures it traces against. Only created when the device supports ray query.
+	std::unique_ptr<RayQueryScene> m_RayQuery;
+	VkShaderModule m_RayQueryShaderModule = VK_NULL_HANDLE;
+	VkPipeline m_RayQueryPipeline = VK_NULL_HANDLE;
 
 	// Scene/frame data, re-written every frame
 	Buffer m_FrameBuffer; // UBO: camera + environment

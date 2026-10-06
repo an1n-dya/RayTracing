@@ -1,8 +1,13 @@
-#version 450
+#version 460
 #extension GL_GOOGLE_include_directive : require
+#ifdef USE_RAY_QUERY
+#extension GL_EXT_ray_query : require
+#endif
 
 // GPU port of the CPU path tracer in Renderer.cpp (Renderer::PerPixel / TraceRay / ClosestHit / Miss).
 // Keeps the same math, RNG, and bounce loop so CPU and GPU output match.
+// Compiled twice: as is (software BVH traversal) and with USE_RAY_QUERY (PathTraceRQ.comp.spv), which traces
+// spheres and meshes through hardware acceleration structures instead (see RayQueryScene.h).
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -102,6 +107,11 @@ struct BVHNode {
 layout(std430, binding = 15) readonly buffer BVHBuffer {
 	BVHNode Nodes[];
 };
+
+#ifdef USE_RAY_QUERY
+// Mesh instances (custom index = instance) and spheres (custom index = sphere), see RayQueryScene::BuildTopLevel
+layout(binding = 18) uniform accelerationStructureEXT TopLevelAS;
+#endif
 
 // Denoiser features, accumulated like the color (see Renderer::PathSample)
 layout(binding = 16, rgba32f) uniform image2D AlbedoDepthImage;  // rgb = albedo, a = depth
@@ -282,17 +292,6 @@ HitPayload TraceRay(vec3 rayOrigin, vec3 rayDirection)
 	uint hitTriangle = 0u;
 	vec2 hitBarycentrics = vec2(0.0);
 
-	for (uint i = 0u; i < u_PC.SphereCount; i++)
-	{
-		float t = IntersectSphere(rayOrigin, rayDirection, Spheres[i].PositionAndRadius.xyz, Spheres[i].PositionAndRadius.w);
-		if (t > 0.0 && t < hitDistance)
-		{
-			hitDistance = t;
-			hitType = OBJECT_SPHERE;
-			hitIndex = int(i);
-		}
-	}
-
 	for (uint i = 0u; i < u_PC.PlaneCount; i++)
 	{
 		float t = IntersectPlane(rayOrigin, rayDirection, Planes[i].Point.xyz, Planes[i].Normal.xyz);
@@ -300,6 +299,51 @@ HitPayload TraceRay(vec3 rayOrigin, vec3 rayDirection)
 		{
 			hitDistance = t;
 			hitType = OBJECT_PLANE;
+			hitIndex = int(i);
+		}
+	}
+
+#ifdef USE_RAY_QUERY
+	// Spheres and meshes, in hardware. Triangles are opaque, so they're committed automatically; sphere candidates
+	// arrive as their bounding boxes and are confirmed here with the exact intersection.
+	rayQueryEXT rayQuery;
+	rayQueryInitializeEXT(rayQuery, TopLevelAS, gl_RayFlagsNoneEXT, 0xFF, rayOrigin, 0.0, rayDirection, hitDistance);
+	while (rayQueryProceedEXT(rayQuery))
+	{
+		if (rayQueryGetIntersectionTypeEXT(rayQuery, false) != gl_RayQueryCandidateIntersectionAABBEXT)
+			continue;
+
+		int sphere = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, false);
+		float t = IntersectSphere(rayOrigin, rayDirection, Spheres[sphere].PositionAndRadius.xyz, Spheres[sphere].PositionAndRadius.w);
+		float closest = rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionNoneEXT
+			? rayQueryGetIntersectionTEXT(rayQuery, true) : hitDistance;
+		if (t > 0.0 && t < closest)
+			rayQueryGenerateIntersectionEXT(rayQuery, t);
+	}
+
+	uint committed = rayQueryGetIntersectionTypeEXT(rayQuery, true);
+	if (committed == gl_RayQueryCommittedIntersectionTriangleEXT)
+	{
+		hitDistance = rayQueryGetIntersectionTEXT(rayQuery, true);
+		hitType = OBJECT_MESH_INSTANCE;
+		hitIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true);
+		hitTriangle = Instances[hitIndex].Info.x + uint(rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true));
+		hitBarycentrics = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
+	}
+	else if (committed == gl_RayQueryCommittedIntersectionGeneratedEXT)
+	{
+		hitDistance = rayQueryGetIntersectionTEXT(rayQuery, true);
+		hitType = OBJECT_SPHERE;
+		hitIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true);
+	}
+#else
+	for (uint i = 0u; i < u_PC.SphereCount; i++)
+	{
+		float t = IntersectSphere(rayOrigin, rayDirection, Spheres[i].PositionAndRadius.xyz, Spheres[i].PositionAndRadius.w);
+		if (t > 0.0 && t < hitDistance)
+		{
+			hitDistance = t;
+			hitType = OBJECT_SPHERE;
 			hitIndex = int(i);
 		}
 	}
@@ -374,6 +418,7 @@ HitPayload TraceRay(vec3 rayOrigin, vec3 rayDirection)
 				stack[stackSize++] = farChild;
 		}
 	}
+#endif
 
 	if (hitType == OBJECT_NONE)
 		return Miss();
