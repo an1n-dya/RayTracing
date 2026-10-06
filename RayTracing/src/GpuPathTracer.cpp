@@ -1,5 +1,9 @@
 #include "GpuPathTracer.h"
 
+#include "RayQueryScene.h"
+#include "VulkanHelpers.h"
+#include "WalnutExtensions.h"
+
 #include "Walnut/Application.h"
 
 #include "backends/imgui_impl_vulkan.h"
@@ -12,166 +16,191 @@
 #include <stdexcept>
 #include <vector>
 
+using namespace VulkanHelpers;
+
 namespace {
+
+	// Descriptor bindings - must match the layout(binding = N) declarations in PathTrace.comp
+	namespace Binding {
+		enum : uint32_t {
+			Frame = 0,             // UBO: camera + environment
+			Spheres = 1,           // SSBO
+			Materials = 2,         // SSBO
+			AccumulationImage = 3, // storage image, rgba32f
+			DisplayImage = 4,      // storage image, rgba8
+			Planes = 5,            // SSBO
+			Instances = 6,         // SSBO: mesh instances
+			Vertices = 7,          // SSBO: all meshes' vertices
+			Indices = 8,           // SSBO: all meshes' triangles (global vertex indices)
+			Lights = 9,            // SSBO: PreparedScene::Lights
+			LightCDF = 10,         // SSBO: PreparedScene::LightCDF
+			EnvironmentTexels = 11,      // SSBO: EnvironmentMap texels
+			EnvironmentMarginal = 12,    // SSBO: its sampling tables
+			EnvironmentConditional = 13,
+			EnvironmentPdf = 14,
+			BVHNodes = 15,         // SSBO: all meshes' BVH nodes
+			AlbedoDepthImage = 16, // storage image, rgba32f: denoiser features
+			NormalMomentImage = 17,
+			Count
+		};
+	}
+
+	const VkDescriptorType BindingTypes[Binding::Count] = {
+		VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+		VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+		VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+	};
+
+	// Only in the layout when the device supports ray query: PathTraceRQ.comp's top-level acceleration structure
+	constexpr uint32_t TopLevelASBinding = Binding::Count;
+
+	// Denoise.comp's bindings: accumulation, albedo/depth, normal/moment, ping, pong (all rgba32f), display (rgba8)
+	constexpr uint32_t DenoiseBindingCount = 6;
 
 	// Mirrors the std430/std140 layouts declared in PathTrace.comp
 	struct SphereGPU {
 		glm::vec4 PositionAndRadius; // xyz = position, w = radius
-		glm::ivec4 MaterialIndex;    // x = material index
+		glm::ivec4 MaterialIndex;    // x = material index, y = light index (-1 if not emissive)
+	};
+
+	struct LightGPU {
+		glm::vec4 Position0;   // sphere center / triangle vertex 0; w = sphere radius
+		glm::vec4 Position1;   // triangle vertex 1; w = triangle area
+		glm::vec4 Position2;   // triangle vertex 2
+		glm::vec4 Normal;      // triangle front-face normal
+		glm::vec4 Emission;    // rgb = radiance, w = selection probability
+		glm::uvec4 Info;       // x = type (0 sphere, 1 triangle), y = object index, z = global triangle index
 	};
 
 	struct MaterialGPU {
 		glm::vec4 AlbedoRoughness;  // rgb = albedo, w = roughness
 		glm::vec4 EmissionAndPower; // rgb = emission color, w = emission power
-		glm::vec4 MetallicPad;      // x = metallic
+		glm::vec4 MetallicTransmissionIOR; // x = metallic, y = transmission, z = IOR
 	};
 
-	struct CameraUBOData {
+	struct PlaneGPU {
+		glm::vec4 Point;
+		glm::vec4 Normal;
+		glm::ivec4 MaterialIndex; // x
+	};
+
+	struct InstanceGPU {
+		glm::mat4 ObjectToWorld;
+		glm::mat4 WorldToObject;
+		glm::uvec4 Info;     // x = first triangle, y = triangle count, z = material index, w = first light (~0u if none)
+		glm::uvec4 Info2;    // x = first BVH node
+	};
+
+	static_assert(sizeof(BVHNode) == 32, "BVHNode must match the shader's layout");
+
+	struct VertexGPU {
+		glm::vec4 Position;
+		glm::vec4 Normal;
+	};
+
+	struct FrameUBOData {
 		glm::mat4 InverseProjection;
 		glm::mat4 InverseView;
 		glm::vec4 Position;
+		glm::vec4 Lens; // x = aperture, y = focus distance
+
+		glm::vec4 SkyBottomColor; // rgb = color, w = intensity
+		glm::vec4 SkyTopColor;
+		int32_t SkyMode;
+		int32_t Pad[3];
+		glm::vec4 EnvironmentParams; // x = rotation (turns), y = light sampling probability
+		glm::uvec4 EnvironmentSize;  // xy = width, height (0 = no map)
 	};
 
 	struct PushConstants {
 		uint32_t Width;
 		uint32_t Height;
-		uint32_t FrameIndex;
+		uint32_t FirstSampleIndex;
 		uint32_t SphereCount;
 		uint32_t Bounces;
+		uint32_t RussianRoulette;
+		uint32_t RussianRouletteStartBounce;
+		uint32_t SampleCount;
+		float Exposure;
+		uint32_t ToneMapper;
+		uint32_t SRGBOutput;
+		uint32_t AntiAliasing;
+		uint32_t ResetAccumulation;
+		uint32_t PlaneCount;
+		uint32_t InstanceCount;
+		uint32_t LightCount;
+		uint32_t LightSampling;
+		uint32_t WriteDisplay; // 0 when the denoiser writes the display image instead
 	};
 
-	uint32_t FindMemoryType(VkMemoryPropertyFlags properties, uint32_t typeBits)
+	struct DenoisePushConstants {
+		uint32_t Width;
+		uint32_t Height;
+		uint32_t Iteration;
+		uint32_t IterationCount;
+		float ColorSigma;
+		float NormalSigma;
+		float DepthSigma;
+		float Exposure;
+		uint32_t ToneMapper;
+		uint32_t SRGBOutput;
+	};
+
+	VkBufferUsageFlags GetBufferUsage(VkDescriptorType type)
 	{
-		VkPhysicalDeviceMemoryProperties memProperties;
-		vkGetPhysicalDeviceMemoryProperties(Walnut::Application::GetPhysicalDevice(), &memProperties);
-		for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++)
-		{
-			if ((memProperties.memoryTypes[i].propertyFlags & properties) == properties && (typeBits & (1 << i)))
-				return i;
-		}
-		return 0xffffffff;
-	}
-
-	void CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buffer, VkDeviceMemory& memory, void** mapped)
-	{
-		VkDevice device = Walnut::Application::GetDevice();
-
-		VkBufferCreateInfo bufferInfo{};
-		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-		bufferInfo.size = size;
-		bufferInfo.usage = usage;
-		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-		VkResult err = vkCreateBuffer(device, &bufferInfo, nullptr, &buffer);
-		check_vk_result(err);
-
-		VkMemoryRequirements memReq;
-		vkGetBufferMemoryRequirements(device, buffer, &memReq);
-
-		VkMemoryAllocateInfo allocInfo{};
-		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-		allocInfo.allocationSize = memReq.size;
-		allocInfo.memoryTypeIndex = FindMemoryType(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, memReq.memoryTypeBits);
-		err = vkAllocateMemory(device, &allocInfo, nullptr, &memory);
-		check_vk_result(err);
-
-		err = vkBindBufferMemory(device, buffer, memory, 0);
-		check_vk_result(err);
-
-		if (mapped)
-		{
-			err = vkMapMemory(device, memory, 0, size, 0, mapped);
-			check_vk_result(err);
-		}
-	}
-
-	void CreateStorageImage(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage,
-		VkImage& image, VkDeviceMemory& memory, VkImageView& view)
-	{
-		VkDevice device = Walnut::Application::GetDevice();
-
-		VkImageCreateInfo imageInfo{};
-		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-		imageInfo.imageType = VK_IMAGE_TYPE_2D;
-		imageInfo.format = format;
-		imageInfo.extent = { width, height, 1 };
-		imageInfo.mipLevels = 1;
-		imageInfo.arrayLayers = 1;
-		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-		imageInfo.usage = usage;
-		imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-		VkResult err = vkCreateImage(device, &imageInfo, nullptr, &image);
-		check_vk_result(err);
-
-		VkMemoryRequirements memReq;
-		vkGetImageMemoryRequirements(device, image, &memReq);
-
-		VkMemoryAllocateInfo allocInfo{};
-		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-		allocInfo.allocationSize = memReq.size;
-		allocInfo.memoryTypeIndex = FindMemoryType(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memReq.memoryTypeBits);
-		err = vkAllocateMemory(device, &allocInfo, nullptr, &memory);
-		check_vk_result(err);
-
-		err = vkBindImageMemory(device, image, memory, 0);
-		check_vk_result(err);
-
-		VkImageViewCreateInfo viewInfo{};
-		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-		viewInfo.image = image;
-		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-		viewInfo.format = format;
-		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		viewInfo.subresourceRange.levelCount = 1;
-		viewInfo.subresourceRange.layerCount = 1;
-		err = vkCreateImageView(device, &viewInfo, nullptr, &view);
-		check_vk_result(err);
-	}
-
-	std::vector<char> ReadFile(const std::string& path)
-	{
-		std::ifstream file(path, std::ios::ate | std::ios::binary);
-		if (!file.is_open())
-			throw std::runtime_error("GpuPathTracer: failed to open shader file: " + path);
-
-		size_t fileSize = (size_t)file.tellg();
-		std::vector<char> buffer(fileSize);
-		file.seekg(0);
-		file.read(buffer.data(), fileSize);
-		return buffer;
-	}
-
-	VkShaderModule CreateShaderModule(const std::vector<char>& code)
-	{
-		VkShaderModuleCreateInfo createInfo{};
-		createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-		createInfo.codeSize = code.size();
-		createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-
-		VkShaderModule shaderModule;
-		VkResult err = vkCreateShaderModule(Walnut::Application::GetDevice(), &createInfo, nullptr, &shaderModule);
-		check_vk_result(err);
-		return shaderModule;
+		return type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT : VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 	}
 
 }
+
+GpuPathTracer::GpuPathTracer() = default;
 
 GpuPathTracer::~GpuPathTracer()
 {
 	if (!m_Initialized)
 		return;
 
-	if (m_AccumulationImage != VK_NULL_HANDLE)
+	if (m_AccumulationImage.Image != VK_NULL_HANDLE)
 		ReleaseImages();
+
+	std::vector<Buffer> buffers = { m_FrameBuffer, m_SphereBuffer, m_MaterialBuffer, m_PlaneBuffer, m_InstanceBuffer,
+		m_VertexBuffer, m_IndexBuffer, m_BVHBuffer, m_LightBuffer, m_LightCDFBuffer, m_EnvironmentTexelBuffer, m_EnvironmentMarginalBuffer,
+		m_EnvironmentConditionalBuffer, m_EnvironmentPdfBuffer };
 
 	Walnut::Application::SubmitResourceFree([shaderModule = m_ShaderModule, pipeline = m_Pipeline,
 		pipelineLayout = m_PipelineLayout, descriptorSetLayout = m_DescriptorSetLayout, descriptorPool = m_DescriptorPool,
-		sampler = m_DisplaySampler, cameraUBO = m_CameraUBO, cameraUBOMemory = m_CameraUBOMemory,
-		sphereSSBO = m_SphereSSBO, sphereSSBOMemory = m_SphereSSBOMemory,
-		materialSSBO = m_MaterialSSBO, materialSSBOMemory = m_MaterialSSBOMemory]()
+		sampler = m_DisplaySampler, buffers, denoiseShaderModule = m_DenoiseShaderModule, denoisePipeline = m_DenoisePipeline,
+		denoisePipelineLayout = m_DenoisePipelineLayout, denoiseSetLayout = m_DenoiseDescriptorSetLayout,
+		denoisePool = m_DenoiseDescriptorPool, rayQueryShaderModule = m_RayQueryShaderModule, rayQueryPipeline = m_RayQueryPipeline]()
 	{
 		VkDevice device = Walnut::Application::GetDevice();
+
+		if (rayQueryPipeline != VK_NULL_HANDLE)
+		{
+			vkDestroyPipeline(device, rayQueryPipeline, nullptr);
+			vkDestroyShaderModule(device, rayQueryShaderModule, nullptr);
+		}
+
+		vkDestroyPipeline(device, denoisePipeline, nullptr);
+		vkDestroyPipelineLayout(device, denoisePipelineLayout, nullptr);
+		vkDestroyDescriptorSetLayout(device, denoiseSetLayout, nullptr);
+		vkDestroyDescriptorPool(device, denoisePool, nullptr);
+		vkDestroyShaderModule(device, denoiseShaderModule, nullptr);
 
 		vkDestroyPipeline(device, pipeline, nullptr);
 		vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
@@ -181,17 +210,15 @@ GpuPathTracer::~GpuPathTracer()
 		if (sampler != VK_NULL_HANDLE)
 			vkDestroySampler(device, sampler, nullptr);
 
-		vkUnmapMemory(device, cameraUBOMemory);
-		vkDestroyBuffer(device, cameraUBO, nullptr);
-		vkFreeMemory(device, cameraUBOMemory, nullptr);
-
-		vkUnmapMemory(device, sphereSSBOMemory);
-		vkDestroyBuffer(device, sphereSSBO, nullptr);
-		vkFreeMemory(device, sphereSSBOMemory, nullptr);
-
-		vkUnmapMemory(device, materialSSBOMemory);
-		vkDestroyBuffer(device, materialSSBO, nullptr);
-		vkFreeMemory(device, materialSSBOMemory, nullptr);
+		for (const Buffer& buffer : buffers)
+		{
+			if (buffer.Handle == VK_NULL_HANDLE)
+				continue;
+			if (buffer.Mapped)
+				vkUnmapMemory(device, buffer.Memory);
+			vkDestroyBuffer(device, buffer.Handle, nullptr);
+			vkFreeMemory(device, buffer.Memory, nullptr);
+		}
 	});
 }
 
@@ -202,57 +229,61 @@ void GpuPathTracer::Init()
 	auto shaderCode = ReadFile("src/shaders/PathTrace.comp.spv");
 	m_ShaderModule = CreateShaderModule(shaderCode);
 
-	VkDescriptorSetLayoutBinding bindings[5]{};
-	bindings[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-	bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-	bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-	bindings[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-	bindings[4] = { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+	bool rayQuery = WalnutExtensions::IsRayQuerySupported();
+
+	std::vector<VkDescriptorSetLayoutBinding> bindings;
+	for (uint32_t i = 0; i < Binding::Count; i++)
+		bindings.push_back({ i, BindingTypes[i], 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr });
+	if (rayQuery)
+		bindings.push_back({ TopLevelASBinding, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr });
 
 	VkDescriptorSetLayoutCreateInfo layoutInfo{};
 	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	layoutInfo.bindingCount = 5;
-	layoutInfo.pBindings = bindings;
+	layoutInfo.bindingCount = (uint32_t)bindings.size();
+	layoutInfo.pBindings = bindings.data();
 	VkResult err = vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_DescriptorSetLayout);
 	check_vk_result(err);
 
-	VkPushConstantRange pushConstantRange{};
-	pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	pushConstantRange.offset = 0;
-	pushConstantRange.size = sizeof(PushConstants);
+	CreateComputePipeline(m_ShaderModule, m_DescriptorSetLayout, sizeof(PushConstants), m_PipelineLayout, m_Pipeline);
 
-	VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
-	pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-	pipelineLayoutInfo.setLayoutCount = 1;
-	pipelineLayoutInfo.pSetLayouts = &m_DescriptorSetLayout;
-	pipelineLayoutInfo.pushConstantRangeCount = 1;
-	pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
-	err = vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &m_PipelineLayout);
-	check_vk_result(err);
+	if (rayQuery)
+	{
+		m_RayQueryShaderModule = CreateShaderModule(ReadFile("src/shaders/PathTraceRQ.comp.spv"));
 
-	VkPipelineShaderStageCreateInfo stageInfo{};
-	stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-	stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-	stageInfo.module = m_ShaderModule;
-	stageInfo.pName = "main";
+		VkPipelineShaderStageCreateInfo stageInfo{};
+		stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+		stageInfo.module = m_RayQueryShaderModule;
+		stageInfo.pName = "main";
 
-	VkComputePipelineCreateInfo pipelineInfo{};
-	pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-	pipelineInfo.stage = stageInfo;
-	pipelineInfo.layout = m_PipelineLayout;
-	err = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_Pipeline);
-	check_vk_result(err);
+		VkComputePipelineCreateInfo pipelineInfo{};
+		pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+		pipelineInfo.stage = stageInfo;
+		pipelineInfo.layout = m_PipelineLayout;
+		err = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_RayQueryPipeline);
+		check_vk_result(err);
 
-	VkDescriptorPoolSize poolSizes[3]{};
-	poolSizes[0] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };
-	poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
-	poolSizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 };
+		m_RayQuery = std::make_unique<RayQueryScene>();
+	}
+	printf("GPU path tracer: hardware ray tracing (VK_KHR_ray_query) %s\n", rayQuery ? "available" : "not available");
+
+	// One pool entry per binding of each type
+	std::vector<VkDescriptorPoolSize> poolSizes;
+	for (const VkDescriptorSetLayoutBinding& binding : bindings)
+	{
+		VkDescriptorType type = binding.descriptorType;
+		auto it = std::find_if(poolSizes.begin(), poolSizes.end(), [type](const VkDescriptorPoolSize& size) { return size.type == type; });
+		if (it != poolSizes.end())
+			it->descriptorCount++;
+		else
+			poolSizes.push_back({ type, 1 });
+	}
 
 	VkDescriptorPoolCreateInfo poolInfo{};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	poolInfo.maxSets = 1;
-	poolInfo.poolSizeCount = 3;
-	poolInfo.pPoolSizes = poolSizes;
+	poolInfo.poolSizeCount = (uint32_t)poolSizes.size();
+	poolInfo.pPoolSizes = poolSizes.data();
 	err = vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_DescriptorPool);
 	check_vk_result(err);
 
@@ -264,74 +295,304 @@ void GpuPathTracer::Init()
 	err = vkAllocateDescriptorSets(device, &dsAllocInfo, &m_DescriptorSet);
 	check_vk_result(err);
 
-	CreateBuffer(sizeof(CameraUBOData), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, m_CameraUBO, m_CameraUBOMemory, &m_CameraUBOMapped);
-	CreateBuffer(MaxSpheres * sizeof(SphereGPU), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, m_SphereSSBO, m_SphereSSBOMemory, &m_SphereSSBOMapped);
-	CreateBuffer(MaxMaterials * sizeof(MaterialGPU), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, m_MaterialSSBO, m_MaterialSSBOMemory, &m_MaterialSSBOMapped);
-
-	VkDescriptorBufferInfo cameraBufferInfo{ m_CameraUBO, 0, sizeof(CameraUBOData) };
-	VkDescriptorBufferInfo sphereBufferInfo{ m_SphereSSBO, 0, MaxSpheres * sizeof(SphereGPU) };
-	VkDescriptorBufferInfo materialBufferInfo{ m_MaterialSSBO, 0, MaxMaterials * sizeof(MaterialGPU) };
-
-	VkWriteDescriptorSet writes[3]{};
-	writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-	writes[0].dstSet = m_DescriptorSet;
-	writes[0].dstBinding = 0;
-	writes[0].descriptorCount = 1;
-	writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-	writes[0].pBufferInfo = &cameraBufferInfo;
-
-	writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-	writes[1].dstSet = m_DescriptorSet;
-	writes[1].dstBinding = 1;
-	writes[1].descriptorCount = 1;
-	writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	writes[1].pBufferInfo = &sphereBufferInfo;
-
-	writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-	writes[2].dstSet = m_DescriptorSet;
-	writes[2].dstBinding = 2;
-	writes[2].descriptorCount = 1;
-	writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	writes[2].pBufferInfo = &materialBufferInfo;
-
-	vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
+	InitDenoiser();
 
 	m_Initialized = true;
 }
 
-void GpuPathTracer::ReleaseImages()
+void GpuPathTracer::InitDenoiser()
 {
-	Walnut::Application::SubmitResourceFree([accumImage = m_AccumulationImage, accumMemory = m_AccumulationImageMemory,
-		accumView = m_AccumulationImageView, displayImage = m_DisplayImage, displayMemory = m_DisplayImageMemory,
-		displayView = m_DisplayImageView]()
+	VkDevice device = Walnut::Application::GetDevice();
+
+	m_DenoiseShaderModule = CreateShaderModule(ReadFile("src/shaders/Denoise.comp.spv"));
+
+	VkDescriptorSetLayoutBinding bindings[DenoiseBindingCount]{};
+	for (uint32_t i = 0; i < DenoiseBindingCount; i++)
+		bindings[i] = { i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+
+	VkDescriptorSetLayoutCreateInfo layoutInfo{};
+	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	layoutInfo.bindingCount = DenoiseBindingCount;
+	layoutInfo.pBindings = bindings;
+	VkResult err = vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_DenoiseDescriptorSetLayout);
+	check_vk_result(err);
+
+	CreateComputePipeline(m_DenoiseShaderModule, m_DenoiseDescriptorSetLayout, sizeof(DenoisePushConstants), m_DenoisePipelineLayout, m_DenoisePipeline);
+
+	VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, DenoiseBindingCount };
+	VkDescriptorPoolCreateInfo poolInfo{};
+	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	poolInfo.maxSets = 1;
+	poolInfo.poolSizeCount = 1;
+	poolInfo.pPoolSizes = &poolSize;
+	err = vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_DenoiseDescriptorPool);
+	check_vk_result(err);
+
+	VkDescriptorSetAllocateInfo allocInfo{};
+	allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	allocInfo.descriptorPool = m_DenoiseDescriptorPool;
+	allocInfo.descriptorSetCount = 1;
+	allocInfo.pSetLayouts = &m_DenoiseDescriptorSetLayout;
+	err = vkAllocateDescriptorSets(device, &allocInfo, &m_DenoiseDescriptorSet);
+	check_vk_result(err);
+}
+
+void GpuPathTracer::Denoise(VkCommandBuffer commandBuffer, const RenderSettings& settings)
+{
+	uint32_t iterations = (uint32_t)std::clamp(settings.DenoiseIterations, 1, 8);
+
+	vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_DenoisePipeline);
+	vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_DenoisePipelineLayout, 0, 1, &m_DenoiseDescriptorSet, 0, nullptr);
+
+	DenoisePushConstants pushConstants{};
+	pushConstants.Width = m_Width;
+	pushConstants.Height = m_Height;
+	pushConstants.IterationCount = iterations;
+	pushConstants.ColorSigma = settings.DenoiseColorSigma;
+	pushConstants.NormalSigma = settings.DenoiseNormalSigma;
+	pushConstants.DepthSigma = settings.DenoiseDepthSigma;
+	pushConstants.Exposure = settings.Exposure;
+	pushConstants.ToneMapper = (uint32_t)settings.ToneMapping;
+	pushConstants.SRGBOutput = settings.SRGBOutput ? 1u : 0u;
+
+	for (uint32_t iteration = 0; iteration < iterations; iteration++)
+	{
+		// The previous pass's writes (the path tracer's, or the last filter pass's) must land before this one reads
+		VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+		barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+		pushConstants.Iteration = iteration;
+		vkCmdPushConstants(commandBuffer, m_DenoisePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DenoisePushConstants), &pushConstants);
+		vkCmdDispatch(commandBuffer, (m_Width + 7) / 8, (m_Height + 7) / 8, 1);
+	}
+
+	m_LastDenoiseIterations = iterations;
+}
+
+void GpuPathTracer::UploadGeometry(const Scene& scene)
+{
+	if (m_GeometryUploaded && m_UploadedGeometryVersion == scene.GeometryVersion)
+		return;
+
+	std::vector<VertexGPU> vertices;
+	std::vector<uint32_t> indices;
+	std::vector<BVHNode> nodes;
+	m_MeshFirstTriangle.clear();
+	m_MeshFirstNode.clear();
+	for (const Mesh& mesh : scene.Meshes)
+	{
+		uint32_t vertexOffset = (uint32_t)vertices.size();
+		m_MeshFirstTriangle.push_back((uint32_t)(indices.size() / 3));
+		m_MeshFirstNode.push_back((uint32_t)nodes.size());
+		// Node links and leaf ranges stay relative to the mesh; the shader adds the instance's offsets
+		nodes.insert(nodes.end(), mesh.BVHNodes.begin(), mesh.BVHNodes.end());
+
+		for (const Vertex& vertex : mesh.Vertices)
+			vertices.push_back({ glm::vec4(vertex.Position, 1.0f), glm::vec4(vertex.Normal, 0.0f) });
+		for (uint32_t index : mesh.Indices)
+			indices.push_back(vertexOffset + index);
+	}
+
+	// With ray query, the vertex and index buffers double as acceleration structure build inputs
+	VkBufferUsageFlags geometryUsage = m_RayQuery
+		? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR : 0;
+	UploadStatic(m_VertexBuffer, Binding::Vertices, vertices.data(), vertices.size() * sizeof(VertexGPU), geometryUsage);
+	UploadStatic(m_IndexBuffer, Binding::Indices, indices.data(), indices.size() * sizeof(uint32_t), geometryUsage);
+	if (m_RayQuery)
+		m_RayQuery->BuildMeshes(scene, m_VertexBuffer.Handle, (uint32_t)vertices.size(), m_IndexBuffer.Handle, m_MeshFirstTriangle);
+	UploadStatic(m_BVHBuffer, Binding::BVHNodes, nodes.data(), nodes.size() * sizeof(BVHNode));
+
+	m_GeometryUploaded = true;
+	m_UploadedGeometryVersion = scene.GeometryVersion;
+}
+
+void GpuPathTracer::UploadEnvironment(const SkySettings& sky)
+{
+	const EnvironmentMap* map = sky.Environment.get();
+	uint64_t version = map ? map->GetVersion() : 0;
+	if (m_EnvironmentUploaded && m_UploadedEnvironmentVersion == version)
+		return;
+
+	if (map)
+	{
+		UploadStatic(m_EnvironmentTexelBuffer, Binding::EnvironmentTexels, map->GetTexels().data(), map->GetTexels().size() * sizeof(glm::vec4));
+		UploadStatic(m_EnvironmentMarginalBuffer, Binding::EnvironmentMarginal, map->GetMarginalCDF().data(), map->GetMarginalCDF().size() * sizeof(float));
+		UploadStatic(m_EnvironmentConditionalBuffer, Binding::EnvironmentConditional, map->GetConditionalCDF().data(), map->GetConditionalCDF().size() * sizeof(float));
+		UploadStatic(m_EnvironmentPdfBuffer, Binding::EnvironmentPdf, map->GetPdf().data(), map->GetPdf().size() * sizeof(float));
+	}
+	else
+	{
+		// Placeholders keep the bindings valid
+		UploadStatic(m_EnvironmentTexelBuffer, Binding::EnvironmentTexels, nullptr, 0);
+		UploadStatic(m_EnvironmentMarginalBuffer, Binding::EnvironmentMarginal, nullptr, 0);
+		UploadStatic(m_EnvironmentConditionalBuffer, Binding::EnvironmentConditional, nullptr, 0);
+		UploadStatic(m_EnvironmentPdfBuffer, Binding::EnvironmentPdf, nullptr, 0);
+	}
+
+	m_EnvironmentUploaded = true;
+	m_UploadedEnvironmentVersion = version;
+}
+
+void GpuPathTracer::ReleaseBuffer(Buffer& buffer)
+{
+	if (buffer.Handle == VK_NULL_HANDLE)
+		return;
+
+	Walnut::Application::SubmitResourceFree([old = buffer]()
 	{
 		VkDevice device = Walnut::Application::GetDevice();
-		vkDestroyImageView(device, accumView, nullptr);
-		vkDestroyImage(device, accumImage, nullptr);
-		vkFreeMemory(device, accumMemory, nullptr);
-		vkDestroyImageView(device, displayView, nullptr);
-		vkDestroyImage(device, displayImage, nullptr);
-		vkFreeMemory(device, displayMemory, nullptr);
+		if (old.Mapped)
+			vkUnmapMemory(device, old.Memory);
+		vkDestroyBuffer(device, old.Handle, nullptr);
+		vkFreeMemory(device, old.Memory, nullptr);
+	});
+	buffer = {};
+}
+
+void GpuPathTracer::UploadStatic(Buffer& buffer, uint32_t binding, const void* data, VkDeviceSize size, VkBufferUsageFlags extraUsage)
+{
+	ReleaseBuffer(buffer);
+
+	buffer.Size = std::max<VkDeviceSize>(size, 256);
+	CreateDeviceLocalBuffer(buffer.Size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | extraUsage, buffer.Handle, buffer.Memory,
+		(extraUsage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0);
+	WriteBufferDescriptor(binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, buffer);
+
+	if (size == 0)
+		return;
+
+	VkDevice device = Walnut::Application::GetDevice();
+	VkBuffer staging;
+	VkDeviceMemory stagingMemory;
+	void* mapped = nullptr;
+	CreateBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging, stagingMemory, &mapped);
+	memcpy(mapped, data, (size_t)size);
+
+	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
+	VkBufferCopy region{ 0, 0, size };
+	vkCmdCopyBuffer(commandBuffer, staging, buffer.Handle, 1, &region);
+
+	VkBufferMemoryBarrier barrier{};
+	barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+	barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer = buffer.Handle;
+	barrier.size = VK_WHOLE_SIZE;
+	vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		0, 0, nullptr, 1, &barrier, 0, nullptr);
+
+	Walnut::Application::FlushCommandBuffer(commandBuffer); // waits, so the staging buffer can go right away
+
+	vkUnmapMemory(device, stagingMemory);
+	vkDestroyBuffer(device, staging, nullptr);
+	vkFreeMemory(device, stagingMemory, nullptr);
+}
+
+void GpuPathTracer::Upload(Buffer& buffer, uint32_t binding, VkDescriptorType type, const void* data, VkDeviceSize size)
+{
+	// Zero-sized buffers are invalid, and every binding must stay valid even when e.g. the scene has no spheres
+	VkDeviceSize requiredSize = std::max<VkDeviceSize>(size, 256);
+
+	if (buffer.Handle == VK_NULL_HANDLE || buffer.Size < requiredSize)
+	{
+		VkDeviceSize newSize = std::max(requiredSize, buffer.Size * 2); // grow geometrically so adding objects one by one stays cheap
+		ReleaseBuffer(buffer);
+
+		buffer.Size = newSize;
+		CreateBuffer(buffer.Size, GetBufferUsage(type), buffer.Handle, buffer.Memory, &buffer.Mapped);
+		WriteBufferDescriptor(binding, type, buffer);
+	}
+
+	if (size > 0)
+		memcpy(buffer.Mapped, data, (size_t)size);
+}
+
+void GpuPathTracer::WriteBufferDescriptor(uint32_t binding, VkDescriptorType type, const Buffer& buffer)
+{
+	VkDescriptorBufferInfo bufferInfo{ buffer.Handle, 0, buffer.Size };
+
+	VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+	write.dstSet = m_DescriptorSet;
+	write.dstBinding = binding;
+	write.descriptorCount = 1;
+	write.descriptorType = type;
+	write.pBufferInfo = &bufferInfo;
+	vkUpdateDescriptorSets(Walnut::Application::GetDevice(), 1, &write, 0, nullptr);
+}
+
+void GpuPathTracer::WriteTopLevelDescriptor()
+{
+	VkAccelerationStructureKHR topLevel = m_RayQuery->GetTopLevel();
+
+	VkWriteDescriptorSetAccelerationStructureKHR accelerationStructureInfo{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
+	accelerationStructureInfo.accelerationStructureCount = 1;
+	accelerationStructureInfo.pAccelerationStructures = &topLevel;
+
+	VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+	write.pNext = &accelerationStructureInfo;
+	write.dstSet = m_DescriptorSet;
+	write.dstBinding = TopLevelASBinding;
+	write.descriptorCount = 1;
+	write.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+	vkUpdateDescriptorSets(Walnut::Application::GetDevice(), 1, &write, 0, nullptr);
+}
+
+void GpuPathTracer::WriteImageDescriptor(VkDescriptorSet set, uint32_t binding, VkImageView view)
+{
+	VkDescriptorImageInfo imageInfo{ VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL };
+
+	VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+	write.dstSet = set;
+	write.dstBinding = binding;
+	write.descriptorCount = 1;
+	write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+	write.pImageInfo = &imageInfo;
+	vkUpdateDescriptorSets(Walnut::Application::GetDevice(), 1, &write, 0, nullptr);
+}
+
+void GpuPathTracer::ReleaseImages()
+{
+	Walnut::Application::SubmitResourceFree([images = std::vector<StorageImage>{ m_AccumulationImage, m_DisplayImage,
+		m_AlbedoDepthImage, m_NormalMomentImage, m_PingImage, m_PongImage }]()
+	{
+		VkDevice device = Walnut::Application::GetDevice();
+		for (const StorageImage& image : images)
+		{
+			vkDestroyImageView(device, image.View, nullptr);
+			vkDestroyImage(device, image.Image, nullptr);
+			vkFreeMemory(device, image.Memory, nullptr);
+		}
 	});
 
-	m_AccumulationImage = VK_NULL_HANDLE;
-	m_AccumulationImageMemory = VK_NULL_HANDLE;
-	m_AccumulationImageView = VK_NULL_HANDLE;
-	m_DisplayImage = VK_NULL_HANDLE;
-	m_DisplayImageMemory = VK_NULL_HANDLE;
-	m_DisplayImageView = VK_NULL_HANDLE;
+	m_AccumulationImage = {};
+	m_DisplayImage = {};
+	m_AlbedoDepthImage = {};
+	m_NormalMomentImage = {};
+	m_PingImage = {};
+	m_PongImage = {};
 }
 
 void GpuPathTracer::CreateImages(uint32_t width, uint32_t height)
 {
-	if (m_AccumulationImage != VK_NULL_HANDLE)
+	if (m_AccumulationImage.Image != VK_NULL_HANDLE)
 		ReleaseImages();
 
 	CreateStorageImage(width, height, VK_FORMAT_R32G32B32A32_SFLOAT,
-		VK_IMAGE_USAGE_STORAGE_BIT, m_AccumulationImage, m_AccumulationImageMemory, m_AccumulationImageView);
+		VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+		m_AccumulationImage.Image, m_AccumulationImage.Memory, m_AccumulationImage.View);
 
 	CreateStorageImage(width, height, VK_FORMAT_R8G8B8A8_UNORM,
-		VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, m_DisplayImage, m_DisplayImageMemory, m_DisplayImageView);
+		VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+		m_DisplayImage.Image, m_DisplayImage.Memory, m_DisplayImage.View);
+
+	for (StorageImage* image : { &m_AlbedoDepthImage, &m_NormalMomentImage, &m_PingImage, &m_PongImage })
+		CreateStorageImage(width, height, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+			image->Image, image->Memory, image->View);
 
 	if (m_DisplaySampler == VK_NULL_HANDLE)
 	{
@@ -350,11 +611,11 @@ void GpuPathTracer::CreateImages(uint32_t width, uint32_t height)
 		check_vk_result(err);
 	}
 
-	// Transition both images UNDEFINED -> GENERAL: GENERAL supports both compute shader read/write
+	// Transition the images UNDEFINED -> GENERAL: GENERAL supports both compute shader read/write
 	// and being sampled by ImGui's fragment shader, so it never needs to change again.
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
-	VkImageMemoryBarrier barriers[2]{};
+	VkImageMemoryBarrier barriers[6]{};
 	for (auto& b : barriers)
 	{
 		b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -367,36 +628,108 @@ void GpuPathTracer::CreateImages(uint32_t width, uint32_t height)
 		b.subresourceRange.levelCount = 1;
 		b.subresourceRange.layerCount = 1;
 	}
-	barriers[0].image = m_AccumulationImage;
-	barriers[1].image = m_DisplayImage;
+	barriers[0].image = m_AccumulationImage.Image;
+	barriers[1].image = m_DisplayImage.Image;
+	barriers[2].image = m_AlbedoDepthImage.Image;
+	barriers[3].image = m_NormalMomentImage.Image;
+	barriers[4].image = m_PingImage.Image;
+	barriers[5].image = m_PongImage.Image;
 
 	vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		0, 0, nullptr, 0, nullptr, 2, barriers);
+		0, 0, nullptr, 0, nullptr, 6, barriers);
 
 	Walnut::Application::FlushCommandBuffer(commandBuffer);
 
 	// Register the display image directly with ImGui - no CPU readback, no Walnut::Image involved.
-	m_DisplayDescriptorSet = (VkDescriptorSet)ImGui_ImplVulkan_AddTexture(m_DisplaySampler, m_DisplayImageView, VK_IMAGE_LAYOUT_GENERAL);
+	m_DisplayDescriptorSet = (VkDescriptorSet)ImGui_ImplVulkan_AddTexture(m_DisplaySampler, m_DisplayImage.View, VK_IMAGE_LAYOUT_GENERAL);
 
-	VkDescriptorImageInfo accumImageInfo{ VK_NULL_HANDLE, m_AccumulationImageView, VK_IMAGE_LAYOUT_GENERAL };
-	VkDescriptorImageInfo displayImageInfo{ VK_NULL_HANDLE, m_DisplayImageView, VK_IMAGE_LAYOUT_GENERAL };
+	WriteImageDescriptor(m_DescriptorSet, Binding::AccumulationImage, m_AccumulationImage.View);
+	WriteImageDescriptor(m_DescriptorSet, Binding::DisplayImage, m_DisplayImage.View);
+	WriteImageDescriptor(m_DescriptorSet, Binding::AlbedoDepthImage, m_AlbedoDepthImage.View);
+	WriteImageDescriptor(m_DescriptorSet, Binding::NormalMomentImage, m_NormalMomentImage.View);
 
-	VkWriteDescriptorSet writes[2]{};
-	writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-	writes[0].dstSet = m_DescriptorSet;
-	writes[0].dstBinding = 3;
-	writes[0].descriptorCount = 1;
-	writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-	writes[0].pImageInfo = &accumImageInfo;
+	const StorageImage* denoiseImages[DenoiseBindingCount] = { &m_AccumulationImage, &m_AlbedoDepthImage, &m_NormalMomentImage,
+		&m_PingImage, &m_PongImage, &m_DisplayImage };
+	for (uint32_t i = 0; i < DenoiseBindingCount; i++)
+		WriteImageDescriptor(m_DenoiseDescriptorSet, i, denoiseImages[i]->View);
+}
 
-	writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-	writes[1].dstSet = m_DescriptorSet;
-	writes[1].dstBinding = 4;
-	writes[1].descriptorCount = 1;
-	writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-	writes[1].pImageInfo = &displayImageInfo;
+void GpuPathTracer::ReadImage(VkImage image, VkDeviceSize bytesPerPixel, void* destination)
+{
+	VkDevice device = Walnut::Application::GetDevice();
+	VkDeviceSize size = (VkDeviceSize)m_Width * m_Height * bytesPerPixel;
 
-	vkUpdateDescriptorSets(Walnut::Application::GetDevice(), 2, writes, 0, nullptr);
+	VkBuffer buffer;
+	VkDeviceMemory memory;
+	void* mapped = nullptr;
+	CreateBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, buffer, memory, &mapped);
+
+	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
+
+	// Compute writes -> transfer read (the image stays in GENERAL)
+	VkImageMemoryBarrier imageBarrier{};
+	imageBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	imageBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	imageBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	imageBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+	imageBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+	imageBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	imageBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	imageBarrier.image = image;
+	imageBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	imageBarrier.subresourceRange.levelCount = 1;
+	imageBarrier.subresourceRange.layerCount = 1;
+	vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0, 0, nullptr, 0, nullptr, 1, &imageBarrier);
+
+	VkBufferImageCopy region{};
+	region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	region.imageSubresource.layerCount = 1;
+	region.imageExtent = { m_Width, m_Height, 1 };
+	vkCmdCopyImageToBuffer(commandBuffer, image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &region);
+
+	VkBufferMemoryBarrier bufferBarrier{};
+	bufferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+	bufferBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	bufferBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+	bufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	bufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	bufferBarrier.buffer = buffer;
+	bufferBarrier.size = VK_WHOLE_SIZE;
+	vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+		0, 0, nullptr, 1, &bufferBarrier, 0, nullptr);
+
+	Walnut::Application::FlushCommandBuffer(commandBuffer); // waits for completion
+
+	memcpy(destination, mapped, (size_t)size);
+
+	vkUnmapMemory(device, memory);
+	vkDestroyBuffer(device, buffer, nullptr);
+	vkFreeMemory(device, memory, nullptr);
+}
+
+void GpuPathTracer::ReadDisplayImage(std::vector<uint32_t>& pixels)
+{
+	pixels.resize((size_t)m_Width * m_Height);
+	if (m_DisplayImage.Image != VK_NULL_HANDLE)
+		ReadImage(m_DisplayImage.Image, sizeof(uint32_t), pixels.data());
+}
+
+void GpuPathTracer::ReadAccumulationImage(std::vector<glm::vec4>& pixels)
+{
+	pixels.resize((size_t)m_Width * m_Height);
+	if (m_AccumulationImage.Image != VK_NULL_HANDLE)
+		ReadImage(m_AccumulationImage.Image, sizeof(glm::vec4), pixels.data());
+}
+
+void GpuPathTracer::ReadDenoisedImage(std::vector<glm::vec4>& pixels)
+{
+	pixels.resize((size_t)m_Width * m_Height);
+	if (m_LastDenoiseIterations == 0)
+		return;
+	// The last pass wrote its linear output to whichever image it would have handed to the next pass
+	const StorageImage& image = (m_LastDenoiseIterations - 1) % 2 == 0 ? m_PingImage : m_PongImage;
+	ReadImage(image.Image, sizeof(glm::vec4), pixels.data());
 }
 
 void GpuPathTracer::OnResize(uint32_t width, uint32_t height)
@@ -415,59 +748,123 @@ void GpuPathTracer::OnResize(uint32_t width, uint32_t height)
 	m_Height = height;
 }
 
-void GpuPathTracer::Render(const Scene& scene, const Camera& camera, uint32_t frameIndex)
+void GpuPathTracer::Render(const Scene& scene, const PreparedScene& prepared, const Camera& camera, const RenderSettings& settings, const FrameParams& frame)
 {
 	if (!m_Initialized || m_Width == 0 || m_Height == 0)
 		return;
 
-	CameraUBOData cameraData{};
-	cameraData.InverseProjection = camera.GetInverseProjection();
-	cameraData.InverseView = camera.GetInverseView();
-	cameraData.Position = glm::vec4(camera.GetPosition(), 1.0f);
-	memcpy(m_CameraUBOMapped, &cameraData, sizeof(cameraData));
+	FrameUBOData frameData{};
+	frameData.InverseProjection = camera.GetInverseProjection();
+	frameData.InverseView = camera.GetInverseView();
+	frameData.Position = glm::vec4(camera.GetPosition(), 1.0f);
+	frameData.Lens = glm::vec4(camera.GetAperture(), camera.GetFocusDistance(), 0.0f, 0.0f);
+	frameData.SkyBottomColor = glm::vec4(scene.Sky.BottomColor, scene.Sky.Intensity);
+	frameData.SkyTopColor = glm::vec4(scene.Sky.TopColor, 0.0f);
+	frameData.SkyMode = (int32_t)scene.Sky.Mode;
+	frameData.EnvironmentParams = glm::vec4(prepared.EnvironmentRotation, prepared.EnvironmentProbability, 0.0f, 0.0f);
+	if (scene.Sky.HasEnvironmentMap())
+		frameData.EnvironmentSize = glm::uvec4(scene.Sky.Environment->GetWidth(), scene.Sky.Environment->GetHeight(), 0u, 0u);
+	// Also when the map isn't selected, so switching sky modes back and forth doesn't re-upload it
+	UploadEnvironment(scene.Sky);
+	Upload(m_FrameBuffer, Binding::Frame, BindingTypes[Binding::Frame], &frameData, sizeof(frameData));
 
-	uint32_t sphereCount = std::min((uint32_t)scene.Spheres.size(), MaxSpheres);
-	if (sphereCount > 0)
+	std::vector<SphereGPU> spheres(scene.Spheres.size());
+	for (size_t i = 0; i < spheres.size(); i++)
 	{
-		std::vector<SphereGPU> spheres(sphereCount);
-		for (uint32_t i = 0; i < sphereCount; i++)
-		{
-			spheres[i].PositionAndRadius = glm::vec4(scene.Spheres[i].Position, scene.Spheres[i].Radius);
-			spheres[i].MaterialIndex = glm::ivec4(scene.Spheres[i].MaterialIndex, 0, 0, 0);
-		}
-		memcpy(m_SphereSSBOMapped, spheres.data(), sphereCount * sizeof(SphereGPU));
+		spheres[i].PositionAndRadius = glm::vec4(scene.Spheres[i].Position, scene.Spheres[i].Radius);
+		spheres[i].MaterialIndex = glm::ivec4(scene.Spheres[i].MaterialIndex, prepared.SphereLights[i], 0, 0);
 	}
+	Upload(m_SphereBuffer, Binding::Spheres, BindingTypes[Binding::Spheres], spheres.data(), spheres.size() * sizeof(SphereGPU));
 
-	uint32_t materialCount = std::min((uint32_t)scene.Materials.size(), MaxMaterials);
-	if (materialCount > 0)
+	std::vector<MaterialGPU> materials(scene.Materials.size());
+	for (size_t i = 0; i < materials.size(); i++)
 	{
-		std::vector<MaterialGPU> materials(materialCount);
-		for (uint32_t i = 0; i < materialCount; i++)
-		{
-			const Material& material = scene.Materials[i];
-			materials[i].AlbedoRoughness = glm::vec4(material.Albedo, material.Roughness);
-			materials[i].EmissionAndPower = glm::vec4(material.EmissionColor, material.EmissionPower);
-			materials[i].MetallicPad = glm::vec4(material.Metallic, 0.0f, 0.0f, 0.0f);
-		}
-		memcpy(m_MaterialSSBOMapped, materials.data(), materialCount * sizeof(MaterialGPU));
+		const Material& material = scene.Materials[i];
+		materials[i].AlbedoRoughness = glm::vec4(material.Albedo, material.Roughness);
+		materials[i].EmissionAndPower = glm::vec4(material.EmissionColor, material.EmissionPower);
+		materials[i].MetallicTransmissionIOR = glm::vec4(material.Metallic, material.Transmission, material.IOR, 0.0f);
 	}
+	Upload(m_MaterialBuffer, Binding::Materials, BindingTypes[Binding::Materials], materials.data(), materials.size() * sizeof(MaterialGPU));
+
+	std::vector<PlaneGPU> planes(scene.Planes.size());
+	for (size_t i = 0; i < planes.size(); i++)
+	{
+		planes[i].Point = glm::vec4(scene.Planes[i].Point, 1.0f);
+		planes[i].Normal = glm::vec4(scene.Planes[i].Normal, 0.0f);
+		planes[i].MaterialIndex = glm::ivec4(scene.Planes[i].MaterialIndex, 0, 0, 0);
+	}
+	Upload(m_PlaneBuffer, Binding::Planes, BindingTypes[Binding::Planes], planes.data(), planes.size() * sizeof(PlaneGPU));
+
+	UploadGeometry(scene);
+
+	std::vector<InstanceGPU> instances(scene.MeshInstances.size());
+	for (size_t i = 0; i < instances.size(); i++)
+	{
+		const MeshInstance& instance = scene.MeshInstances[i];
+		const Mesh& mesh = scene.Meshes[instance.MeshIndex];
+		instances[i].ObjectToWorld = prepared.Instances[i].ObjectToWorld;
+		instances[i].WorldToObject = prepared.Instances[i].WorldToObject;
+		instances[i].Info = glm::uvec4(m_MeshFirstTriangle[instance.MeshIndex], mesh.GetTriangleCount(), (uint32_t)instance.MaterialIndex,
+			(uint32_t)prepared.InstanceLightOffsets[i]); // -1 becomes ~0u
+		instances[i].Info2 = glm::uvec4(m_MeshFirstNode[instance.MeshIndex], (uint32_t)mesh.BVHNodes.size(), 0u, 0u);
+	}
+	Upload(m_InstanceBuffer, Binding::Instances, BindingTypes[Binding::Instances], instances.data(), instances.size() * sizeof(InstanceGPU));
+
+	std::vector<LightGPU> lights(prepared.Lights.size());
+	for (size_t i = 0; i < lights.size(); i++)
+	{
+		const PreparedScene::Light& light = prepared.Lights[i];
+		lights[i].Position0 = glm::vec4(light.Position0, light.Radius);
+		lights[i].Position1 = glm::vec4(light.Position1, light.Area);
+		lights[i].Position2 = glm::vec4(light.Position2, 0.0f);
+		lights[i].Normal = glm::vec4(light.Normal, 0.0f);
+		lights[i].Emission = glm::vec4(light.Emission, light.Probability);
+		// The shader identifies triangles by their index in the concatenated index buffer
+		uint32_t globalTriangle = light.Type == PreparedScene::LightType::Triangle
+			? m_MeshFirstTriangle[scene.MeshInstances[light.ObjectIndex].MeshIndex] + light.Triangle : 0u;
+		lights[i].Info = glm::uvec4((uint32_t)light.Type, light.ObjectIndex, globalTriangle, 0u);
+	}
+	Upload(m_LightBuffer, Binding::Lights, BindingTypes[Binding::Lights], lights.data(), lights.size() * sizeof(LightGPU));
+	Upload(m_LightCDFBuffer, Binding::LightCDF, BindingTypes[Binding::LightCDF], prepared.LightCDF.data(), prepared.LightCDF.size() * sizeof(float));
 
 	PushConstants pushConstants{};
 	pushConstants.Width = m_Width;
 	pushConstants.Height = m_Height;
-	pushConstants.FrameIndex = frameIndex;
-	pushConstants.SphereCount = sphereCount;
-	pushConstants.Bounces = Bounces;
+	pushConstants.FirstSampleIndex = frame.FirstSampleIndex;
+	pushConstants.SphereCount = (uint32_t)spheres.size();
+	pushConstants.Bounces = (uint32_t)std::max(settings.MaxBounces, 1);
+	pushConstants.RussianRoulette = settings.RussianRoulette ? 1u : 0u;
+	pushConstants.RussianRouletteStartBounce = (uint32_t)std::max(settings.RussianRouletteStartBounce, 0);
+	pushConstants.SampleCount = frame.SampleCount;
+	pushConstants.ResetAccumulation = frame.ResetAccumulation ? 1u : 0u;
+	pushConstants.Exposure = settings.Exposure;
+	pushConstants.ToneMapper = (uint32_t)settings.ToneMapping;
+	pushConstants.SRGBOutput = settings.SRGBOutput ? 1u : 0u;
+	pushConstants.AntiAliasing = settings.AntiAliasing ? 1u : 0u;
+	pushConstants.PlaneCount = (uint32_t)planes.size();
+	pushConstants.InstanceCount = (uint32_t)instances.size();
+	pushConstants.LightCount = (uint32_t)lights.size();
+	pushConstants.LightSampling = settings.LightSampling ? 1u : 0u;
+	pushConstants.WriteDisplay = settings.Denoise ? 0u : 1u;
 
 	VkCommandBuffer commandBuffer = Walnut::Application::GetCommandBuffer(true);
 
-	vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_Pipeline);
+	// Hardware ray tracing: rebuild the top-level structure for this frame's transforms. Its descriptor has to be
+	// up to date before the set is bound below.
+	bool rayQuery = m_RayQuery && settings.HardwareRayTracing;
+	if (rayQuery && m_RayQuery->BuildTopLevel(commandBuffer, scene, prepared))
+		WriteTopLevelDescriptor();
+
+	vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rayQuery ? m_RayQueryPipeline : m_Pipeline);
 	vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_PipelineLayout, 0, 1, &m_DescriptorSet, 0, nullptr);
 	vkCmdPushConstants(commandBuffer, m_PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pushConstants);
 
 	uint32_t groupsX = (m_Width + 7) / 8;
 	uint32_t groupsY = (m_Height + 7) / 8;
 	vkCmdDispatch(commandBuffer, groupsX, groupsY, 1);
+
+	if (settings.Denoise)
+		Denoise(commandBuffer, settings);
 
 	// Make the compute writes to DisplayImage visible to the fragment shader ImGui uses to sample it
 	VkImageMemoryBarrier barrier{};
@@ -478,7 +875,7 @@ void GpuPathTracer::Render(const Scene& scene, const Camera& camera, uint32_t fr
 	barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.image = m_DisplayImage;
+	barrier.image = m_DisplayImage.Image;
 	barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 	barrier.subresourceRange.levelCount = 1;
 	barrier.subresourceRange.layerCount = 1;

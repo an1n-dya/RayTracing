@@ -1,19 +1,47 @@
-#version 450
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#ifdef USE_RAY_QUERY
+#extension GL_EXT_ray_query : require
+#endif
 
 // GPU port of the CPU path tracer in Renderer.cpp (Renderer::PerPixel / TraceRay / ClosestHit / Miss).
-// Keeps the same math, RNG, and 5-bounce loop so CPU and GPU output match.
+// Keeps the same math, RNG, and bounce loop so CPU and GPU output match.
+// Compiled twice: as is (software BVH traversal) and with USE_RAY_QUERY (PathTraceRQ.comp.spv), which traces
+// spheres and meshes through hardware acceleration structures instead (see RayQueryScene.h).
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(std140, binding = 0) uniform CameraData {
+const float PI = 3.14159265358979323846;
+const float FLT_MAX = 3.402823466e+38;
+
+// Matches ObjectType in Scene.h
+const int OBJECT_NONE = 0;
+const int OBJECT_SPHERE = 1;
+const int OBJECT_PLANE = 2;
+const int OBJECT_MESH_INSTANCE = 3;
+
+#include "BSDF.glsl"
+#include "Intersection.glsl"
+#include "LightSampling.glsl"
+#include "ToneMapping.glsl"
+
+layout(std140, binding = 0) uniform FrameData {
 	mat4 InverseProjection;
 	mat4 InverseView;
 	vec4 Position; // xyz used
+	vec4 Lens;     // x = aperture (lens diameter, 0 = pinhole), y = focus distance
+
+	// Scene::Sky
+	vec4 SkyBottomColor; // rgb = color, w = intensity
+	vec4 SkyTopColor;    // rgb = color
+	int SkyMode;         // 0 = none, 1 = gradient, 2 = environment map
+	vec4 EnvironmentParams; // x = rotation (turns), y = light sampling probability
+	uvec4 EnvironmentSize;  // xy = width, height (0 = no map)
 } u_Camera;
 
 struct Sphere {
 	vec4 PositionAndRadius; // xyz = position, w = radius
-	ivec4 MaterialIndex;    // x = material index
+	ivec4 MaterialIndex;    // x = material index, y = light index (-1 if not emissive)
 };
 
 layout(std430, binding = 1) readonly buffer SphereBuffer {
@@ -23,7 +51,7 @@ layout(std430, binding = 1) readonly buffer SphereBuffer {
 struct Material {
 	vec4 AlbedoRoughness;  // rgb = albedo, w = roughness
 	vec4 EmissionAndPower; // rgb = emission color, w = emission power
-	vec4 MetallicPad;      // x = metallic
+	vec4 MetallicTransmissionIOR; // x = metallic, y = transmission, z = IOR
 };
 
 layout(std430, binding = 2) readonly buffer MaterialBuffer {
@@ -33,15 +61,125 @@ layout(std430, binding = 2) readonly buffer MaterialBuffer {
 layout(binding = 3, rgba32f) uniform image2D AccumulationImage;
 layout(binding = 4, rgba8) uniform image2D DisplayImage;
 
+struct Plane {
+	vec4 Point;          // xyz
+	vec4 Normal;         // xyz, unit length
+	ivec4 MaterialIndex; // x
+};
+
+layout(std430, binding = 5) readonly buffer PlaneBuffer {
+	Plane Planes[];
+};
+
+struct MeshInstance {
+	mat4 ObjectToWorld;
+	mat4 WorldToObject;
+	uvec4 Info;     // x = first triangle (in Indices / 3), y = triangle count, z = material index, w = first light (~0u if none)
+	uvec4 Info2;    // x = first BVH node, y = node count (0 = empty mesh)
+};
+
+layout(std430, binding = 6) readonly buffer InstanceBuffer {
+	MeshInstance Instances[];
+};
+
+struct Vertex {
+	vec4 Position; // xyz
+	vec4 Normal;   // xyz
+};
+
+// All meshes' vertices and (global) triangle indices, concatenated
+layout(std430, binding = 7) readonly buffer VertexBuffer {
+	Vertex Vertices[];
+};
+
+layout(std430, binding = 8) readonly buffer IndexBuffer {
+	uint Indices[];
+};
+
+// Per-mesh BVHs (BVH.h), concatenated. Child links and leaf triangle ranges are relative to the mesh.
+struct BVHNode {
+	vec3 BoundsMin;
+	uint LeftOrFirst;   // interior: left child (right = left + 1); leaf: first triangle
+	vec3 BoundsMax;
+	uint TriangleCount; // 0 for interior nodes
+};
+
+layout(std430, binding = 15) readonly buffer BVHBuffer {
+	BVHNode Nodes[];
+};
+
+#ifdef USE_RAY_QUERY
+// Mesh instances (custom index = instance) and spheres (custom index = sphere), see RayQueryScene::BuildTopLevel
+layout(binding = 18) uniform accelerationStructureEXT TopLevelAS;
+#endif
+
+// Denoiser features, accumulated like the color (see Renderer::PathSample)
+layout(binding = 16, rgba32f) uniform image2D AlbedoDepthImage;  // rgb = albedo, a = depth
+layout(binding = 17, rgba32f) uniform image2D NormalMomentImage; // xyz = normal, w = radiance luminance^2
+
+// PreparedScene::Lights: emissive spheres and the triangles of emissive mesh instances
+struct Light {
+	vec4 Position0; // sphere center / triangle vertex 0; w = sphere radius
+	vec4 Position1; // triangle vertex 1; w = triangle area
+	vec4 Position2; // triangle vertex 2
+	vec4 Normal;    // triangle front-face normal (only the front emits)
+	vec4 Emission;  // rgb = radiance, w = selection probability
+	uvec4 Info;     // x = type (0 sphere, 1 triangle), y = object index, z = global triangle index
+};
+
+const uint LIGHT_SPHERE = 0u;
+const uint LIGHT_TRIANGLE = 1u;
+
+layout(std430, binding = 9) readonly buffer LightBuffer {
+	Light Lights[];
+};
+
+layout(std430, binding = 10) readonly buffer LightCDFBuffer {
+	float LightCDF[];
+};
+
+// EnvironmentMap texels (row 0 = straight up) and its importance sampling tables
+layout(std430, binding = 11) readonly buffer EnvironmentTexelBuffer {
+	vec4 EnvTexels[];
+};
+
+layout(std430, binding = 12) readonly buffer EnvironmentMarginalBuffer {
+	float EnvMarginalCDF[];
+};
+
+layout(std430, binding = 13) readonly buffer EnvironmentConditionalBuffer {
+	float EnvConditionalCDF[];
+};
+
+layout(std430, binding = 14) readonly buffer EnvironmentPdfBuffer {
+	float EnvPdf[];
+};
+
+#define EnvSize u_Camera.EnvironmentSize.xy
+#include "Environment.glsl"
+
 layout(push_constant) uniform PushConstants {
 	uint Width;
 	uint Height;
-	uint FrameIndex;
+	uint FirstSampleIndex; // global index of this frame's first sample (seeds the RNG)
 	uint SphereCount;
 	uint Bounces;
+	uint RussianRoulette;
+	uint RussianRouletteStartBounce;
+	uint SampleCount; // samples per pixel this frame; 0 = only re-resolve the accumulated image (converged)
+	float Exposure;   // stops
+	uint ToneMapper;  // 0 = none, 1 = Reinhard, 2 = ACES
+	uint SRGBOutput;
+	uint AntiAliasing; // jitter samples within the pixel
+	uint ResetAccumulation;
+	uint PlaneCount;
+	uint InstanceCount;
+	uint LightCount;
+	uint LightSampling; // next-event estimation with MIS
+	uint WriteDisplay;  // 0 when the denoiser writes the display image instead
 } u_PC;
 
-// -- RNG: same PCG hash as Utils::PCG_Hash / RandomFloat / InUnitSphere in Renderer.cpp --
+// -- RNG: same PCG hash as Utils::PCG_Hash / RandomFloat in Renderer.cpp --
 
 uint PCGHash(uint input_)
 {
@@ -50,18 +188,33 @@ uint PCGHash(uint input_)
 	return (word >> 22u) ^ word;
 }
 
+// Uniform in [0, 1): the top 24 bits fit a float's mantissa exactly, so the result can never round up to 1
 float RandomFloat(inout uint seed)
 {
 	seed = PCGHash(seed);
-	return float(seed) / 4294967295.0; // uint32 max
+	return float(seed >> 8u) * (1.0 / 16777216.0);
 }
 
-vec3 RandomInUnitSphere(inout uint seed)
+
+// accumulated.rgb is a sum of radiance samples and accumulated.a is how many there are
+vec4 ResolveColor(vec4 accumulated)
 {
-	return normalize(vec3(
-		RandomFloat(seed) * 2.0 - 1.0,
-		RandomFloat(seed) * 2.0 - 1.0,
-		RandomFloat(seed) * 2.0 - 1.0));
+	vec3 color = accumulated.a > 0.0 ? accumulated.rgb / accumulated.a : vec3(0.0);
+	return vec4(ApplyToneMapping(color, u_PC.Exposure, u_PC.ToneMapper, u_PC.SRGBOutput), 1.0);
+}
+
+// -- Sky: same as Sky::GetRadiance in Scene.h --
+
+vec3 SkyRadiance(vec3 direction)
+{
+	if (u_Camera.SkyMode == 1)
+	{
+		float t = 0.5 * (direction.y + 1.0);
+		return mix(u_Camera.SkyBottomColor.rgb, u_Camera.SkyTopColor.rgb, t) * u_Camera.SkyBottomColor.w;
+	}
+	if (u_Camera.SkyMode == 2 && u_Camera.EnvironmentSize.x > 0u)
+		return EnvLookup(direction, u_Camera.EnvironmentParams.x) * u_Camera.SkyBottomColor.w;
+	return vec3(0.0);
 }
 
 // -- Ray/scene intersection: same as Renderer::TraceRay / ClosestHit / Miss --
@@ -69,8 +222,12 @@ vec3 RandomInUnitSphere(inout uint seed)
 struct HitPayload {
 	float HitDistance;
 	vec3 WorldPosition;
-	vec3 WorldNormal;
+	vec3 WorldNormal;     // shading normal, on the same side as GeometricNormal
+	vec3 GeometricNormal;
+	int ObjectType;
 	int ObjectIndex;
+	uint Triangle; // global triangle index, for mesh instances
+	int MaterialIndex;
 };
 
 HitPayload Miss()
@@ -79,97 +236,466 @@ HitPayload Miss()
 	payload.HitDistance = -0.1;
 	payload.WorldPosition = vec3(0.0);
 	payload.WorldNormal = vec3(0.0);
+	payload.GeometricNormal = vec3(0.0);
+	payload.ObjectType = OBJECT_NONE;
 	payload.ObjectIndex = -1;
+	payload.Triangle = 0u;
+	payload.MaterialIndex = 0;
 	return payload;
 }
 
-HitPayload ClosestHit(vec3 rayOrigin, vec3 rayDirection, float hitDistance, int objectIndex)
+HitPayload ClosestHit(vec3 rayOrigin, vec3 rayDirection, float hitDistance, int objectType, int objectIndex, uint triangle, vec2 barycentrics)
 {
 	HitPayload payload;
 	payload.HitDistance = hitDistance;
+	payload.ObjectType = objectType;
 	payload.ObjectIndex = objectIndex;
+	payload.Triangle = triangle;
+	payload.WorldPosition = rayOrigin + rayDirection * hitDistance;
 
-	vec3 spherePosition = Spheres[objectIndex].PositionAndRadius.xyz;
+	if (objectType == OBJECT_SPHERE)
+	{
+		payload.MaterialIndex = Spheres[objectIndex].MaterialIndex.x;
+		payload.WorldNormal = normalize(payload.WorldPosition - Spheres[objectIndex].PositionAndRadius.xyz);
+		payload.GeometricNormal = payload.WorldNormal;
+	}
+	else if (objectType == OBJECT_PLANE)
+	{
+		payload.MaterialIndex = Planes[objectIndex].MaterialIndex.x;
+		payload.WorldNormal = Planes[objectIndex].Normal.xyz;
+		payload.GeometricNormal = payload.WorldNormal;
+	}
+	else
+	{
+		payload.MaterialIndex = int(Instances[objectIndex].Info.z);
+		Vertex a = Vertices[Indices[triangle * 3u + 0u]];
+		Vertex b = Vertices[Indices[triangle * 3u + 1u]];
+		Vertex c = Vertices[Indices[triangle * 3u + 2u]];
 
-	vec3 origin = rayOrigin - spherePosition;
-	payload.WorldPosition = origin + rayDirection * hitDistance;
-	payload.WorldNormal = normalize(payload.WorldPosition);
-
-	payload.WorldPosition += spherePosition;
+		// Normals go object -> world with the inverse transpose: n * WorldToObject (as a row vector)
+		mat3 worldToObject = mat3(Instances[objectIndex].WorldToObject);
+		vec3 shading = (1.0 - barycentrics.x - barycentrics.y) * a.Normal.xyz + barycentrics.x * b.Normal.xyz + barycentrics.y * c.Normal.xyz;
+		payload.WorldNormal = normalize(shading * worldToObject);
+		payload.GeometricNormal = normalize(cross(b.Position.xyz - a.Position.xyz, c.Position.xyz - a.Position.xyz) * worldToObject);
+		if (dot(payload.GeometricNormal, payload.WorldNormal) < 0.0)
+			payload.GeometricNormal = -payload.GeometricNormal;
+	}
 
 	return payload;
 }
 
 HitPayload TraceRay(vec3 rayOrigin, vec3 rayDirection)
 {
-	int closestSphere = -1;
-	float hitDistance = 3.402823466e+38; // FLT_MAX
+	float hitDistance = FLT_MAX;
+	int hitType = OBJECT_NONE;
+	int hitIndex = -1;
+	uint hitTriangle = 0u;
+	vec2 hitBarycentrics = vec2(0.0);
 
-	for (uint i = 0u; i < u_PC.SphereCount; i++)
+	for (uint i = 0u; i < u_PC.PlaneCount; i++)
 	{
-		vec3 spherePosition = Spheres[i].PositionAndRadius.xyz;
-		float radius = Spheres[i].PositionAndRadius.w;
-
-		vec3 origin = rayOrigin - spherePosition;
-
-		float a = dot(rayDirection, rayDirection);
-		float b = 2.0 * dot(origin, rayDirection);
-		float c = dot(origin, origin) - radius * radius;
-
-		float discriminant = b * b - 4.0 * a * c;
-		if (discriminant < 0.0)
-			continue;
-
-		float closestT = (-b - sqrt(discriminant)) / (2.0 * a);
-		if (closestT > 0.0 && closestT < hitDistance)
+		float t = IntersectPlane(rayOrigin, rayDirection, Planes[i].Point.xyz, Planes[i].Normal.xyz);
+		if (t > 0.0 && t < hitDistance)
 		{
-			hitDistance = closestT;
-			closestSphere = int(i);
+			hitDistance = t;
+			hitType = OBJECT_PLANE;
+			hitIndex = int(i);
 		}
 	}
 
-	if (closestSphere < 0)
+#ifdef USE_RAY_QUERY
+	// Spheres and meshes, in hardware. Triangles are opaque, so they're committed automatically; sphere candidates
+	// arrive as their bounding boxes and are confirmed here with the exact intersection.
+	rayQueryEXT rayQuery;
+	rayQueryInitializeEXT(rayQuery, TopLevelAS, gl_RayFlagsNoneEXT, 0xFF, rayOrigin, 0.0, rayDirection, hitDistance);
+	while (rayQueryProceedEXT(rayQuery))
+	{
+		if (rayQueryGetIntersectionTypeEXT(rayQuery, false) != gl_RayQueryCandidateIntersectionAABBEXT)
+			continue;
+
+		int sphere = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, false);
+		float t = IntersectSphere(rayOrigin, rayDirection, Spheres[sphere].PositionAndRadius.xyz, Spheres[sphere].PositionAndRadius.w);
+		float closest = rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionNoneEXT
+			? rayQueryGetIntersectionTEXT(rayQuery, true) : hitDistance;
+		if (t > 0.0 && t < closest)
+			rayQueryGenerateIntersectionEXT(rayQuery, t);
+	}
+
+	uint committed = rayQueryGetIntersectionTypeEXT(rayQuery, true);
+	if (committed == gl_RayQueryCommittedIntersectionTriangleEXT)
+	{
+		hitDistance = rayQueryGetIntersectionTEXT(rayQuery, true);
+		hitType = OBJECT_MESH_INSTANCE;
+		hitIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true);
+		hitTriangle = Instances[hitIndex].Info.x + uint(rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true));
+		hitBarycentrics = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
+	}
+	else if (committed == gl_RayQueryCommittedIntersectionGeneratedEXT)
+	{
+		hitDistance = rayQueryGetIntersectionTEXT(rayQuery, true);
+		hitType = OBJECT_SPHERE;
+		hitIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true);
+	}
+#else
+	for (uint i = 0u; i < u_PC.SphereCount; i++)
+	{
+		float t = IntersectSphere(rayOrigin, rayDirection, Spheres[i].PositionAndRadius.xyz, Spheres[i].PositionAndRadius.w);
+		if (t > 0.0 && t < hitDistance)
+		{
+			hitDistance = t;
+			hitType = OBJECT_SPHERE;
+			hitIndex = int(i);
+		}
+	}
+
+	for (uint i = 0u; i < u_PC.InstanceCount; i++)
+	{
+		if (Instances[i].Info2.y == 0u)
+			continue;
+
+		// Object space; the direction isn't renormalized, so distances stay comparable with world space
+		vec3 origin = vec3(Instances[i].WorldToObject * vec4(rayOrigin, 1.0));
+		vec3 direction = mat3(Instances[i].WorldToObject) * rayDirection;
+		vec3 inverseDirection = 1.0 / direction;
+		uint firstNode = Instances[i].Info2.x;
+		uint firstTriangle = Instances[i].Info.x;
+
+		const vec3 padding = vec3(1e-4); // flat meshes (quads) have zero-thickness bounds
+		if (IntersectAABB(origin, inverseDirection, Nodes[firstNode].BoundsMin - padding, Nodes[firstNode].BoundsMax + padding, hitDistance) < 0.0)
+			continue;
+
+		// Stack-based BVH traversal, nearer child first (same as Renderer::TraceRay)
+		uint stack[64];
+		uint stackSize = 0u;
+		uint nodeIndex = 0u;
+		while (true)
+		{
+			BVHNode node = Nodes[firstNode + nodeIndex];
+			if (node.TriangleCount > 0u)
+			{
+				for (uint local = node.LeftOrFirst; local < node.LeftOrFirst + node.TriangleCount; local++)
+				{
+					uint triangle = firstTriangle + local;
+					vec3 v0 = Vertices[Indices[triangle * 3u + 0u]].Position.xyz;
+					vec3 v1 = Vertices[Indices[triangle * 3u + 1u]].Position.xyz;
+					vec3 v2 = Vertices[Indices[triangle * 3u + 2u]].Position.xyz;
+					vec2 barycentrics;
+					float t = IntersectTriangle(origin, direction, v0, v1, v2, barycentrics);
+					if (t > 0.0 && t < hitDistance)
+					{
+						hitDistance = t;
+						hitType = OBJECT_MESH_INSTANCE;
+						hitIndex = int(i);
+						hitTriangle = triangle;
+						hitBarycentrics = barycentrics;
+					}
+				}
+				if (stackSize == 0u)
+					break;
+				nodeIndex = stack[--stackSize];
+				continue;
+			}
+
+			uint nearChild = node.LeftOrFirst, farChild = node.LeftOrFirst + 1u;
+			BVHNode nearNode = Nodes[firstNode + nearChild], farNode = Nodes[firstNode + farChild];
+			float nearDistance = IntersectAABB(origin, inverseDirection, nearNode.BoundsMin - padding, nearNode.BoundsMax + padding, hitDistance);
+			float farDistance = IntersectAABB(origin, inverseDirection, farNode.BoundsMin - padding, farNode.BoundsMax + padding, hitDistance);
+			if (nearDistance < 0.0 || (farDistance >= 0.0 && farDistance < nearDistance))
+			{
+				uint swapChild = nearChild; nearChild = farChild; farChild = swapChild;
+				float swapDistance = nearDistance; nearDistance = farDistance; farDistance = swapDistance;
+			}
+
+			if (nearDistance < 0.0)
+			{
+				if (stackSize == 0u)
+					break;
+				nodeIndex = stack[--stackSize];
+				continue;
+			}
+			nodeIndex = nearChild;
+			if (farDistance >= 0.0)
+				stack[stackSize++] = farChild;
+		}
+	}
+#endif
+
+	if (hitType == OBJECT_NONE)
 		return Miss();
 
-	return ClosestHit(rayOrigin, rayDirection, hitDistance, closestSphere);
+	return ClosestHit(rayOrigin, rayDirection, hitDistance, hitType, hitIndex, hitTriangle, hitBarycentrics);
 }
 
-vec3 PerPixel(uvec2 pixelCoord)
+// -- Light sampling: same as Renderer::SampleDirectLight / LightPdf --
+
+uint SelectLight(float u)
 {
-	vec2 coord = (vec2(pixelCoord) + vec2(0.5)) / vec2(u_PC.Width, u_PC.Height);
+	uint low = 0u, high = u_PC.LightCount - 1u;
+	while (low < high)
+	{
+		uint middle = (low + high) / 2u;
+		if (u < LightCDF[middle])
+			high = middle;
+		else
+			low = middle + 1u;
+	}
+	return low;
+}
+
+vec3 SampleDirectLight(vec3 origin, vec3 normal, vec3 geometricNormal, vec3 wo, SurfaceMaterial material, inout uint seed)
+{
+	float uLight = RandomFloat(seed);
+	float u1 = RandomFloat(seed);
+	float u2 = RandomFloat(seed);
+
+	float environmentProbability = u_Camera.EnvironmentParams.y;
+	if (uLight < environmentProbability)
+	{
+		vec3 direction;
+		float pdf;
+		if (!SampleEnvironment(u_Camera.EnvironmentParams.x, u1, u2, direction, pdf))
+			return vec3(0.0);
+		if (dot(direction, geometricNormal) <= 0.0)
+			return vec3(0.0);
+
+		vec3 f = EvaluateBSDF(material, normal, wo, direction);
+		if (f.r <= 0.0 && f.g <= 0.0 && f.b <= 0.0)
+			return vec3(0.0);
+
+		if (TraceRay(origin, direction).HitDistance >= 0.0)
+			return vec3(0.0);
+
+		float lightPdf = environmentProbability * pdf;
+		float weight = PowerHeuristic(lightPdf, PdfBSDF(material, normal, wo, direction));
+		vec3 radiance = EnvLookup(direction, u_Camera.EnvironmentParams.x) * u_Camera.SkyBottomColor.w;
+		return f * radiance * (weight / lightPdf);
+	}
+
+	if (u_PC.LightCount == 0u)
+		return vec3(0.0);
+
+	Light light = Lights[SelectLight((uLight - environmentProbability) / (1.0 - environmentProbability))];
+
+	vec3 direction;
+	float pdf;
+	if (light.Info.x == LIGHT_SPHERE)
+	{
+		if (!SampleSphereLight(origin, light.Position0.xyz, light.Position0.w, u1, u2, direction, pdf))
+			return vec3(0.0);
+	}
+	else
+	{
+		float distance;
+		if (!SampleTriangleLight(origin, light.Position0.xyz, light.Position1.xyz, light.Position2.xyz, light.Normal.xyz, light.Position1.w, u1, u2, direction, distance, pdf))
+			return vec3(0.0);
+	}
+
+	if (dot(direction, geometricNormal) <= 0.0)
+		return vec3(0.0);
+
+	vec3 f = EvaluateBSDF(material, normal, wo, direction);
+	if (f.r <= 0.0 && f.g <= 0.0 && f.b <= 0.0)
+		return vec3(0.0);
+
+	HitPayload hit = TraceRay(origin, direction);
+	bool visible = light.Info.x == LIGHT_SPHERE
+		? (hit.ObjectType == OBJECT_SPHERE && hit.ObjectIndex == int(light.Info.y))
+		: (hit.ObjectType == OBJECT_MESH_INSTANCE && hit.ObjectIndex == int(light.Info.y) && hit.Triangle == light.Info.z);
+	if (!visible)
+		return vec3(0.0);
+
+	float lightPdf = (1.0 - environmentProbability) * light.Emission.w * pdf;
+	float weight = PowerHeuristic(lightPdf, PdfBSDF(material, normal, wo, direction));
+	return f * light.Emission.rgb * (weight / lightPdf);
+}
+
+float LightPdf(HitPayload hit, vec3 rayOrigin, vec3 rayDirection)
+{
+	if (hit.ObjectType == OBJECT_SPHERE)
+	{
+		int lightIndex = Spheres[hit.ObjectIndex].MaterialIndex.y;
+		if (lightIndex < 0)
+			return 0.0;
+		Light light = Lights[lightIndex];
+		return (1.0 - u_Camera.EnvironmentParams.y) * light.Emission.w * SphereLightPdf(rayOrigin, light.Position0.xyz, light.Position0.w);
+	}
+	if (hit.ObjectType == OBJECT_MESH_INSTANCE)
+	{
+		uint lightOffset = Instances[hit.ObjectIndex].Info.w;
+		if (lightOffset == 0xffffffffu)
+			return 0.0;
+		Light light = Lights[lightOffset + (hit.Triangle - Instances[hit.ObjectIndex].Info.x)];
+		float cosLight = abs(dot(hit.GeometricNormal, rayDirection));
+		return (1.0 - u_Camera.EnvironmentParams.y) * light.Emission.w * TriangleLightPdf(hit.HitDistance, cosLight, light.Position1.w);
+	}
+	return 0.0;
+}
+
+// One path's result: same as Renderer::PathSample
+struct PathSample {
+	vec3 Radiance;
+	vec3 Albedo;
+	vec3 Normal;
+	float Depth;
+};
+
+PathSample PerPixel(uvec2 pixelCoord, uint sampleIndex)
+{
+	// Decorrelate pixels and samples: every (pixel, sample) pair gets its own random stream
+	uint seed = PCGHash((pixelCoord.x + pixelCoord.y * u_PC.Width) ^ PCGHash(sampleIndex));
+
+	vec2 jitter = vec2(0.5);
+	if (u_PC.AntiAliasing != 0u)
+	{
+		jitter.x = RandomFloat(seed);
+		jitter.y = RandomFloat(seed);
+	}
+
+	vec2 coord = (vec2(pixelCoord) + jitter) / vec2(u_PC.Width, u_PC.Height);
 	coord = coord * 2.0 - 1.0; // -1 -> 1
 
+	// Thin-lens camera, same as Camera::GenerateRay. View space: camera at the origin looking down -Z.
 	vec4 target = u_Camera.InverseProjection * vec4(coord.x, coord.y, 1.0, 1.0);
-	vec3 rayDirection = vec3(u_Camera.InverseView * vec4(normalize(vec3(target) / target.w), 0.0));
-	vec3 rayOrigin = u_Camera.Position.xyz;
+	vec3 viewDirection = normalize(vec3(target) / target.w);
+	vec3 viewOrigin = vec3(0.0);
+
+	float aperture = u_Camera.Lens.x;
+	if (aperture > 0.0)
+	{
+		vec2 lensSample;
+		lensSample.x = RandomFloat(seed);
+		lensSample.y = RandomFloat(seed);
+
+		vec3 focusPoint = viewDirection * (u_Camera.Lens.y / -viewDirection.z);
+
+		float radius = 0.5 * aperture * sqrt(lensSample.x);
+		float theta = 2.0 * PI * lensSample.y;
+		viewOrigin = vec3(radius * cos(theta), radius * sin(theta), 0.0);
+		viewDirection = normalize(focusPoint - viewOrigin);
+	}
+
+	vec3 rayOrigin = vec3(u_Camera.InverseView * vec4(viewOrigin, 1.0));
+	vec3 rayDirection = vec3(u_Camera.InverseView * vec4(viewDirection, 0.0));
 
 	vec3 light = vec3(0.0);
 	vec3 contribution = vec3(1.0);
 
-	uint seed = pixelCoord.x + pixelCoord.y * u_PC.Width;
-	seed *= u_PC.FrameIndex;
+	bool lightSampling = u_PC.LightSampling != 0u && (u_PC.LightCount > 0u || u_Camera.EnvironmentParams.y > 0.0);
+	float previousPdf = 0.0;
+	bool previousDelta = true;
+
+	PathSample result;
+	result.Albedo = vec3(1.0);
+	result.Normal = vec3(0.0);
+	result.Depth = 0.0;
+	bool featuresRecorded = false;
 
 	for (uint i = 0u; i < u_PC.Bounces; i++)
 	{
-		seed += i;
-
 		HitPayload payload = TraceRay(rayOrigin, rayDirection);
 		if (payload.HitDistance < 0.0)
-			break; // sky term intentionally unused, matching the CPU renderer
+		{
+			if (i == 0u)
+				result.Depth = 1e4;
+			featuresRecorded = true;
 
-		int materialIndex = Spheres[payload.ObjectIndex].MaterialIndex.x;
-		vec3 albedo = Materials[materialIndex].AlbedoRoughness.rgb;
+			// The environment map is also a light that light sampling aims at: share it via MIS
+			float weight = 1.0;
+			if (lightSampling && !previousDelta && u_Camera.EnvironmentParams.y > 0.0)
+			{
+				float lightPdf = u_Camera.EnvironmentParams.y * EnvPdfForDirection(rayDirection, u_Camera.EnvironmentParams.x);
+				weight = PowerHeuristic(previousPdf, lightPdf);
+			}
+			light += SkyRadiance(rayDirection) * contribution * weight;
+			break;
+		}
+
+		if (i == 0u)
+			result.Depth = payload.HitDistance;
+
+		int materialIndex = payload.MaterialIndex;
+		SurfaceMaterial material;
+		material.Albedo = Materials[materialIndex].AlbedoRoughness.rgb;
+		material.Roughness = Materials[materialIndex].AlbedoRoughness.w;
+		material.Metallic = Materials[materialIndex].MetallicTransmissionIOR.x;
+		material.Transmission = Materials[materialIndex].MetallicTransmissionIOR.y;
+		material.IOR = Materials[materialIndex].MetallicTransmissionIOR.z;
 		vec3 emissionColor = Materials[materialIndex].EmissionAndPower.rgb;
 		float emissionPower = Materials[materialIndex].EmissionAndPower.w;
 
-		contribution *= albedo;
-		light += emissionColor * emissionPower;
+		// Only the front face of a surface emits (the side its normal points to)
+		vec3 wo = -rayDirection;
+		bool frontFace = dot(payload.GeometricNormal, wo) >= 0.0;
 
-		rayOrigin = payload.WorldPosition + payload.WorldNormal * 0.0001;
-		rayDirection = normalize(payload.WorldNormal + RandomInUnitSphere(seed));
+		// Emission is weighted by the throughput accumulated *before* this surface scatters the path,
+		// and shared with light sampling via MIS when that could have found it too
+		vec3 emission = emissionColor * emissionPower;
+		if (frontFace && (emission.r > 0.0 || emission.g > 0.0 || emission.b > 0.0))
+		{
+			float weight = 1.0;
+			if (lightSampling && !previousDelta)
+			{
+				float lightPdf = LightPdf(payload, rayOrigin, rayDirection);
+				if (lightPdf > 0.0)
+					weight = PowerHeuristic(previousPdf, lightPdf);
+			}
+			light += emission * contribution * weight;
+		}
+
+		// Shade with the normals facing the incoming ray (a ray can hit a surface from behind, e.g. from inside glass)
+		vec3 geometricNormal = frontFace ? payload.GeometricNormal : -payload.GeometricNormal;
+		vec3 normal = frontFace ? payload.WorldNormal : -payload.WorldNormal;
+		if (dot(normal, wo) <= 0.0)
+			normal = geometricNormal;
+
+		if (!featuresRecorded)
+		{
+			bool mirrorLike = GlassWeight(material) > 0.5 || (material.Metallic > 0.5 && material.Roughness < 0.2);
+			if (!mirrorLike || i >= 2u)
+			{
+				result.Albedo = material.Albedo;
+				result.Normal = normal;
+				featuresRecorded = true;
+			}
+		}
+
+		// Not at the last bounce (its MIS partner would never be traced), nor for pure glass
+		if (lightSampling && i + 1u < u_PC.Bounces && GlassWeight(material) < 1.0)
+			light += contribution * SampleDirectLight(payload.WorldPosition + geometricNormal * 0.0001, normal, geometricNormal, wo, material, seed);
+
+		vec3 u;
+		u.x = RandomFloat(seed);
+		u.y = RandomFloat(seed);
+		u.z = RandomFloat(seed);
+
+		BSDFSample bsdfSample;
+		if (!SampleBSDF(material, normal, wo, frontFace, u, bsdfSample))
+			break;
+		// A reflection that dips below the actual surface would leak light
+		bool leavesAbove = dot(bsdfSample.Direction, geometricNormal) > 0.0;
+		if (!bsdfSample.Delta && !leavesAbove)
+			break;
+		contribution *= bsdfSample.Weight;
+
+		previousPdf = bsdfSample.Pdf;
+		previousDelta = bsdfSample.Delta;
+
+		// Nudge the origin off the surface, to whichever side the new ray leaves on
+		rayOrigin = payload.WorldPosition + geometricNormal * (leavesAbove ? 0.0001 : -0.0001);
+		rayDirection = bsdfSample.Direction;
+
+		// Russian roulette (same as Renderer::PerPixel)
+		if (u_PC.RussianRoulette != 0u && i >= u_PC.RussianRouletteStartBounce)
+		{
+			float p = clamp(max(contribution.r, max(contribution.g, contribution.b)), 0.05, 1.0);
+			if (RandomFloat(seed) > p)
+				break;
+			contribution /= p;
+		}
 	}
 
-	return light;
+	result.Radiance = light;
+	return result;
 }
 
 void main()
@@ -178,17 +704,26 @@ void main()
 	if (pixelCoord.x >= u_PC.Width || pixelCoord.y >= u_PC.Height)
 		return;
 
-	vec3 color = PerPixel(pixelCoord);
+	ivec2 coord = ivec2(pixelCoord);
+	vec4 accumulatedColor = u_PC.ResetAccumulation != 0u ? vec4(0.0) : imageLoad(AccumulationImage, coord);
+	if (u_PC.SampleCount > 0u)
+	{
+		vec4 albedoDepth = u_PC.ResetAccumulation != 0u ? vec4(0.0) : imageLoad(AlbedoDepthImage, coord);
+		vec4 normalMoment = u_PC.ResetAccumulation != 0u ? vec4(0.0) : imageLoad(NormalMomentImage, coord);
+		for (uint s = 0u; s < u_PC.SampleCount; s++)
+		{
+			PathSample pathSample = PerPixel(pixelCoord, u_PC.FirstSampleIndex + s);
+			float luminance = Luminance(pathSample.Radiance);
+			accumulatedColor += vec4(pathSample.Radiance, 1.0);
+			albedoDepth += vec4(pathSample.Albedo, pathSample.Depth);
+			normalMoment += vec4(pathSample.Normal, luminance * luminance);
+		}
 
-	vec4 accumulatedColor;
-	if (u_PC.FrameIndex == 1u)
-		accumulatedColor = vec4(color, 1.0);
-	else
-		accumulatedColor = imageLoad(AccumulationImage, ivec2(pixelCoord)) + vec4(color, 1.0);
+		imageStore(AccumulationImage, coord, accumulatedColor);
+		imageStore(AlbedoDepthImage, coord, albedoDepth);
+		imageStore(NormalMomentImage, coord, normalMoment);
+	}
 
-	imageStore(AccumulationImage, ivec2(pixelCoord), accumulatedColor);
-
-	vec4 displayColor = accumulatedColor / float(u_PC.FrameIndex);
-	displayColor = clamp(displayColor, vec4(0.0), vec4(1.0));
-	imageStore(DisplayImage, ivec2(pixelCoord), displayColor);
+	if (u_PC.WriteDisplay != 0u)
+		imageStore(DisplayImage, coord, ResolveColor(accumulatedColor));
 }

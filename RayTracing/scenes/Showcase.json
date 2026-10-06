@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "camera": {
+    "position": [0, 1.4, 7.5],
+    "direction": [0, -0.11, -1],
+    "verticalFov": 40,
+    "aperture": 0.06,
+    "focusDistance": 7.4,
+    "moveSpeed": 5
+  },
+  "sky": {
+    "mode": "gradient",
+    "topColor": [0.35, 0.55, 1],
+    "bottomColor": [1, 0.95, 0.9],
+    "intensity": 0.6
+  },
+  "materials": [
+    {
+      "name": "Ground",
+      "albedo": [0.55, 0.55, 0.55],
+      "roughness": 0.7
+    },
+    {
+      "name": "Glass",
+      "albedo": [1, 1, 1],
+      "roughness": 0,
+      "transmission": 1,
+      "ior": 1.5
+    },
+    {
+      "name": "Gold",
+      "albedo": [1, 0.78, 0.34],
+      "roughness": 0.25,
+      "metallic": 1
+    },
+    {
+      "name": "Blue Plastic",
+      "albedo": [0.1, 0.25, 0.9],
+      "roughness": 0.35
+    },
+    {
+      "name": "Mirror",
+      "albedo": [0.95, 0.95, 0.95],
+      "roughness": 0,
+      "metallic": 1
+    },
+    {
+      "name": "Frosted Glass",
+      "albedo": [0.8, 1, 0.9],
+      "roughness": 0.3,
+      "transmission": 1,
+      "ior": 1.45
+    },
+    {
+      "name": "Warm Light",
+      "albedo": [1, 1, 1],
+      "emissionColor": [1, 0.85, 0.6],
+      "emissionPower": 12
+    }
+  ],
+  "spheres": [
+    { "position": [0, -100, 0], "radius": 100, "material": 0 },
+    { "position": [0, 1, 0], "radius": 1, "material": 1 },
+    { "position": [-2.3, 0.8, -0.6], "radius": 0.8, "material": 2 },
+    { "position": [2.3, 0.8, -0.6], "radius": 0.8, "material": 3 },
+    { "position": [-1.15, 0.4, 1.7], "radius": 0.4, "material": 4 },
+    { "position": [1.15, 0.4, 1.7], "radius": 0.4, "material": 5 },
+    { "position": [1.5, 4.5, 2.5], "radius": 0.6, "material": 6 }
+  ]
+}

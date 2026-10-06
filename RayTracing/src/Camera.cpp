@@ -1,5 +1,6 @@
 #include "Camera.h"
 
+#include <glm/gtc/constants.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtx/quaternion.hpp>
@@ -13,6 +14,7 @@ Camera::Camera(float verticalFOV, float nearClip, float farClip)
 {
 	m_ForwardDirection = glm::vec3(0, 0, -1);
 	m_Position = glm::vec3(0, 0, 6);
+	RecalculateView(); // otherwise the view matrices stay identity until the camera first moves
 }
 
 bool Camera::OnUpdate(float ts)
@@ -34,7 +36,7 @@ bool Camera::OnUpdate(float ts)
 	constexpr glm::vec3 upDirection(0.0f, 1.0f, 0.0f);
 	glm::vec3 rightDirection = glm::cross(m_ForwardDirection, upDirection);
 
-	float speed = 5.0f;
+	float speed = m_MoveSpeed;
 
 	// Movement
 	if (Input::IsKeyDown(KeyCode::W))
@@ -82,10 +84,7 @@ bool Camera::OnUpdate(float ts)
 	}
 
 	if (moved)
-	{
 		RecalculateView();
-		RecalculateRayDirections();
-	}
 
 	return moved;
 }
@@ -99,7 +98,23 @@ void Camera::OnResize(uint32_t width, uint32_t height)
 	m_ViewportHeight = height;
 
 	RecalculateProjection();
-	RecalculateRayDirections();
+}
+
+void Camera::SetView(const glm::vec3& position, const glm::vec3& direction)
+{
+	m_Position = position;
+	if (glm::dot(direction, direction) > 0.0f)
+		m_ForwardDirection = glm::normalize(direction);
+	RecalculateView();
+}
+
+void Camera::SetVerticalFOV(float verticalFOV)
+{
+	if (verticalFOV == m_VerticalFOV)
+		return;
+
+	m_VerticalFOV = verticalFOV;
+	RecalculateProjection();
 }
 
 float Camera::GetRotationSpeed()
@@ -109,6 +124,9 @@ float Camera::GetRotationSpeed()
 
 void Camera::RecalculateProjection()
 {
+	if (m_ViewportWidth == 0 || m_ViewportHeight == 0)
+		return; // no viewport yet (e.g. a scene loaded at startup); OnResize will compute it
+
 	m_Projection = glm::perspectiveFov(glm::radians(m_VerticalFOV), (float)m_ViewportWidth, (float)m_ViewportHeight, m_NearClip, m_FarClip);
 	m_InverseProjection = glm::inverse(m_Projection);
 }
@@ -119,20 +137,32 @@ void Camera::RecalculateView()
 	m_InverseView = glm::inverse(m_View);
 }
 
-void Camera::RecalculateRayDirections()
+glm::vec3 Camera::GetRayDirection(const glm::vec2& ndc) const
 {
-	m_RayDirections.resize(m_ViewportWidth * m_ViewportHeight);
+	glm::vec4 target = m_InverseProjection * glm::vec4(ndc.x, ndc.y, 1, 1);
+	return glm::vec3(m_InverseView * glm::vec4(glm::normalize(glm::vec3(target) / target.w), 0)); // World space
+}
 
-	for (uint32_t y = 0; y < m_ViewportHeight; y++)
+Ray Camera::GenerateRay(const glm::vec2& ndc, const glm::vec2& lensSample) const
+{
+	// View space: the camera sits at the origin looking down -Z
+	glm::vec4 target = m_InverseProjection * glm::vec4(ndc.x, ndc.y, 1, 1);
+	glm::vec3 direction = glm::normalize(glm::vec3(target) / target.w);
+	glm::vec3 origin(0.0f);
+
+	if (m_Aperture > 0.0f)
 	{
-		for (uint32_t x = 0; x < m_ViewportWidth; x++)
-		{
-			glm::vec2 coord = { (float)x / (float)m_ViewportWidth, (float)y / (float)m_ViewportHeight };
-			coord = coord * 2.0f - 1.0f; // -1 -> 1
+		// Every ray through this pixel converges on the same point of the focus plane
+		glm::vec3 focusPoint = direction * (m_FocusDistance / -direction.z);
 
-			glm::vec4 target = m_InverseProjection * glm::vec4(coord.x, coord.y, 1, 1);
-			glm::vec3 rayDirection = glm::vec3(m_InverseView * glm::vec4(glm::normalize(glm::vec3(target) / target.w), 0)); // World space
-			m_RayDirections[x + y * m_ViewportWidth] = rayDirection;
-		}
+		float radius = 0.5f * m_Aperture * glm::sqrt(lensSample.x);
+		float theta = 2.0f * glm::pi<float>() * lensSample.y;
+		origin = glm::vec3(radius * glm::cos(theta), radius * glm::sin(theta), 0.0f);
+		direction = glm::normalize(focusPoint - origin);
 	}
+
+	Ray ray;
+	ray.Origin = glm::vec3(m_InverseView * glm::vec4(origin, 1.0f));
+	ray.Direction = glm::vec3(m_InverseView * glm::vec4(direction, 0.0f));
+	return ray;
 }
