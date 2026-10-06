@@ -76,6 +76,17 @@ public:
 		if (ImGui::Button("Reset"))
 			m_Renderer.ResetFrameIndex();
 
+		if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+			float verticalFOV = m_Camera.GetVerticalFOV();
+			if (ImGui::SliderFloat("Vertical FOV", &verticalFOV, 10.0f, 120.0f, "%.1f deg")) {
+				m_Camera.SetVerticalFOV(verticalFOV);
+				m_Renderer.ResetFrameIndex();
+			}
+			float moveSpeed = m_Camera.GetMoveSpeed();
+			if (ImGui::DragFloat("Move Speed", &moveSpeed, 0.1f, 0.1f, 100.0f, "%.1f units/s"))
+				m_Camera.SetMoveSpeed(moveSpeed);
+		}
+
 		ImGui::End();
 
 		bool sceneChanged = false;

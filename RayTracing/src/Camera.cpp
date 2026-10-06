@@ -34,7 +34,7 @@ bool Camera::OnUpdate(float ts)
 	constexpr glm::vec3 upDirection(0.0f, 1.0f, 0.0f);
 	glm::vec3 rightDirection = glm::cross(m_ForwardDirection, upDirection);
 
-	float speed = 5.0f;
+	float speed = m_MoveSpeed;
 
 	// Movement
 	if (Input::IsKeyDown(KeyCode::W))
@@ -98,6 +98,16 @@ void Camera::OnResize(uint32_t width, uint32_t height)
 	m_ViewportWidth = width;
 	m_ViewportHeight = height;
 
+	RecalculateProjection();
+	RecalculateRayDirections();
+}
+
+void Camera::SetVerticalFOV(float verticalFOV)
+{
+	if (verticalFOV == m_VerticalFOV)
+		return;
+
+	m_VerticalFOV = verticalFOV;
 	RecalculateProjection();
 	RecalculateRayDirections();
 }
