@@ -1,5 +1,6 @@
 #include "Renderer.h"
 
+#include "BSDF.h"
 #include "ImageExport.h"
 #include "ToneMapping.h"
 
@@ -28,14 +29,6 @@ namespace Utils {
 	static float RandomFloat(uint32_t& seed) {
 		seed = PCG_Hash(seed);
 		return (float)seed / (float)std::numeric_limits<uint32_t>::max();
-	}
-
-	static glm::vec3 InUnitSphere(uint32_t& seed) {
-		return glm::normalize(glm::vec3(
-			RandomFloat(seed) * 2.0f - 1.0f,
-			RandomFloat(seed) * 2.0f - 1.0f,
-			RandomFloat(seed) * 2.0f - 1.0f)
-		);
 	}
 
 #define MT 1
@@ -167,14 +160,26 @@ glm::vec4 Renderer::PerPixel(uint32_t x, uint32_t y, uint32_t sampleIndex) {
 		const Sphere& sphere = m_ActiveScene->Spheres[payload.ObjectIndex];
 		const Material& material = m_ActiveScene->Materials[sphere.MaterialIndex];
 
-		// Emission is weighted by the throughput accumulated *before* this surface's albedo is applied
+		// Emission is weighted by the throughput accumulated *before* this surface scatters the path
 		light += material.GetEmission() * contribution;
-		contribution *= material.Albedo;
 
-		ray.Origin = payload.WorldPosition + payload.WorldNormal * 0.0001f;
-		//ray.Direction = glm::reflect(ray.Direction,
-		//	payload.WorldNormal + material.Roughness * Walnut::Random::Vec3(-0.5f, 0.5f));
-		ray.Direction = glm::normalize(payload.WorldNormal + RandomInUnitSphere(seed));
+		// Shade with the normal facing the incoming ray (a ray can hit a surface from behind)
+		glm::vec3 wo = -ray.Direction;
+		glm::vec3 normal = glm::dot(payload.WorldNormal, wo) < 0.0f ? -payload.WorldNormal : payload.WorldNormal;
+
+		// Draw the random numbers one at a time so the order matches the GPU path
+		glm::vec3 u;
+		u.x = RandomFloat(seed);
+		u.y = RandomFloat(seed);
+		u.z = RandomFloat(seed);
+
+		BSDF::Sample bsdfSample;
+		if (!BSDF::SampleDirection(material, normal, wo, u, bsdfSample))
+			break;
+		contribution *= bsdfSample.Weight;
+
+		ray.Origin = payload.WorldPosition + normal * 0.0001f;
+		ray.Direction = bsdfSample.Direction;
 
 		// Russian roulette: randomly end paths that can't carry much more light, boosting the
 		// survivors by 1/p so the estimate stays unbiased.
@@ -193,12 +198,6 @@ float Renderer::RandomFloat(uint32_t& seed) const {
 	if (m_Settings.SlowRandom)
 		return Walnut::Random::Float();
 	return Utils::RandomFloat(seed);
-}
-
-glm::vec3 Renderer::RandomInUnitSphere(uint32_t& seed) const {
-	if (m_Settings.SlowRandom)
-		return Walnut::Random::InUnitSphere();
-	return Utils::InUnitSphere(seed);
 }
 
 Renderer::HitPayload Renderer::TraceRay(const Ray& ray) {

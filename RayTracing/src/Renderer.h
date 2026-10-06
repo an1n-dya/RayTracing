@@ -51,7 +51,6 @@ private:
 
 	// Dispatch to the fast PCG hash or Walnut::Random depending on Settings.SlowRandom
 	float RandomFloat(uint32_t& seed) const;
-	glm::vec3 RandomInUnitSphere(uint32_t& seed) const;
 
 	HitPayload TraceRay(const Ray& ray);
 	HitPayload ClosestHit(const Ray& ray, float hitDistance, int objectIndex);

@@ -5,7 +5,7 @@ project "RayTracing"
    targetdir "bin/%{cfg.buildcfg}"
    staticruntime "off"
 
-   files { "src/**.h", "src/**.cpp", "src/**.comp" }
+   files { "src/**.h", "src/**.cpp", "src/**.comp", "src/**.glsl" }
 
    includedirs
    {

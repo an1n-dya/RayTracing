@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 // GPU port of the CPU path tracer in Renderer.cpp (Renderer::PerPixel / TraceRay / ClosestHit / Miss).
 // Keeps the same math, RNG, and bounce loop so CPU and GPU output match.
@@ -6,6 +7,8 @@
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 const float PI = 3.14159265358979323846;
+
+#include "BSDF.glsl"
 
 layout(std140, binding = 0) uniform FrameData {
 	mat4 InverseProjection;
@@ -57,7 +60,7 @@ layout(push_constant) uniform PushConstants {
 	uint ResetAccumulation;
 } u_PC;
 
-// -- RNG: same PCG hash as Utils::PCG_Hash / RandomFloat / InUnitSphere in Renderer.cpp --
+// -- RNG: same PCG hash as Utils::PCG_Hash / RandomFloat in Renderer.cpp --
 
 uint PCGHash(uint input_)
 {
@@ -72,13 +75,6 @@ float RandomFloat(inout uint seed)
 	return float(seed) / 4294967295.0; // uint32 max
 }
 
-vec3 RandomInUnitSphere(inout uint seed)
-{
-	return normalize(vec3(
-		RandomFloat(seed) * 2.0 - 1.0,
-		RandomFloat(seed) * 2.0 - 1.0,
-		RandomFloat(seed) * 2.0 - 1.0));
-}
 
 // -- Tone mapping: same as ToneMapping.h --
 
@@ -241,16 +237,32 @@ vec3 PerPixel(uvec2 pixelCoord, uint sampleIndex)
 		}
 
 		int materialIndex = Spheres[payload.ObjectIndex].MaterialIndex.x;
-		vec3 albedo = Materials[materialIndex].AlbedoRoughness.rgb;
+		SurfaceMaterial material;
+		material.Albedo = Materials[materialIndex].AlbedoRoughness.rgb;
+		material.Roughness = Materials[materialIndex].AlbedoRoughness.w;
+		material.Metallic = Materials[materialIndex].MetallicPad.x;
 		vec3 emissionColor = Materials[materialIndex].EmissionAndPower.rgb;
 		float emissionPower = Materials[materialIndex].EmissionAndPower.w;
 
-		// Emission is weighted by the throughput accumulated *before* this surface's albedo is applied
+		// Emission is weighted by the throughput accumulated *before* this surface scatters the path
 		light += emissionColor * emissionPower * contribution;
-		contribution *= albedo;
 
-		rayOrigin = payload.WorldPosition + payload.WorldNormal * 0.0001;
-		rayDirection = normalize(payload.WorldNormal + RandomInUnitSphere(seed));
+		// Shade with the normal facing the incoming ray (a ray can hit a surface from behind)
+		vec3 wo = -rayDirection;
+		vec3 normal = dot(payload.WorldNormal, wo) < 0.0 ? -payload.WorldNormal : payload.WorldNormal;
+
+		vec3 u;
+		u.x = RandomFloat(seed);
+		u.y = RandomFloat(seed);
+		u.z = RandomFloat(seed);
+
+		BSDFSample bsdfSample;
+		if (!SampleBSDF(material, normal, wo, u, bsdfSample))
+			break;
+		contribution *= bsdfSample.Weight;
+
+		rayOrigin = payload.WorldPosition + normal * 0.0001;
+		rayDirection = bsdfSample.Direction;
 
 		// Russian roulette (same as Renderer::PerPixel)
 		if (u_PC.RussianRoulette != 0u && i >= u_PC.RussianRouletteStartBounce)
